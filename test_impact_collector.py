@@ -1,9 +1,16 @@
 import ast
 import unittest
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from impact_collector import metadata_references, record_event
+from impact_collector import (
+    MAX_TRACED_KEYS_PER_TEST,
+    metadata_references,
+    record_event,
+    test_domain,
+    trace_key,
+)
 
 
 class ImpactCollectorTests(unittest.TestCase):
@@ -27,6 +34,105 @@ class ImpactCollectorTests(unittest.TestCase):
             )
         self.assertEqual(uncertain, set())
         self.assertEqual(reads, {})
+
+    def test_transform_loader_reads_are_not_treated_as_source_inspection(self):
+        reads = defaultdict(set)
+        collector = SimpleNamespace(
+            local=SimpleNamespace(instrumenting_import=True)
+        )
+        with patch("impact_collector._trace_collector", collector):
+            record_event(
+                "open", ("/src/sqlglot/example.py",), "test:example",
+                defaultdict(set), set(), reads, set(),
+            )
+        self.assertEqual(reads, {})
+
+    def test_collection_time_reads_are_not_attributed_to_runtime_tests(self):
+        reads = defaultdict(set)
+        collector = SimpleNamespace(local=SimpleNamespace())
+        with patch("impact_collector._trace_collector", collector):
+            record_event(
+                "open", ("/src/sqlglot/example.py",), "",
+                defaultdict(set), set(), reads, uncertain := set(),
+            )
+        self.assertEqual(reads, {})
+        self.assertEqual(uncertain, set())
+
+    def test_setup_domain_records_primitives_and_fixture_parameters(self):
+        item = SimpleNamespace(
+            callspec=SimpleNamespace(params={"version": (23, 12)}),
+            funcargs={"scale": "MICROS"},
+            instance=SimpleNamespace(),
+            cls=SimpleNamespace(
+                __mro__=(SimpleNamespace(__dict__={"dialect": "tsql"}),)
+            ),
+        )
+        domain = test_domain(item)
+        self.assertIn('{"__tuple__":[23,12]}', domain["version"])
+        self.assertIn('"MICROS"', domain["scale"])
+
+    def test_only_semantic_mapping_names_are_traced(self):
+        import ast
+        from impact_collector import _mapping_names
+
+        tree = ast.parse(
+            "NUMERIC_ESCAPES = {'u': 1}\n"
+            "arg_types = {'this': True, 'expression': False}\n"
+            "SHOW_PARSERS = {'GROUPS': None}\n"
+            "FUNCTIONS = {'REGEXP_SPLIT': None}\n"
+        )
+        self.assertEqual(
+            _mapping_names(tree),
+            {"SHOW_PARSERS", "FUNCTIONS"},
+        )
+
+    def test_auto_mapping_trace_resolves_parser_table_owner(self):
+        class Parser:
+            SHOW_PARSERS = {"GROUPS": object()}
+
+        collector = SimpleNamespace(
+            context="tests/example.py::test_groups",
+            trace_key_seen=set(),
+            trace_key_counts=defaultdict(int),
+            key_values=defaultdict(set),
+        )
+        parser = Parser()
+        with patch("impact_collector._trace_collector", collector):
+            trace_key(
+                "AUTO",
+                "GROUPS",
+                parser,
+                parser.SHOW_PARSERS,
+            )
+            trace_key("AUTO", "GROUPS", parser, {})
+        self.assertEqual(
+            set(collector.key_values),
+            {(
+                "test_impact_collector::ImpactCollectorTests.test_auto_mapping_trace_resolves_parser_table_owner.<locals>.Parser::SHOW_PARSERS",
+                '{"value":"GROUPS"}',
+            )},
+        )
+
+    def test_key_trace_cap_records_unknown_marker(self):
+        collector = SimpleNamespace(
+            context="tests/example.py::test_groups",
+            trace_key_seen=set(),
+            trace_key_counts=defaultdict(int, {"tests/example.py::test_groups": MAX_TRACED_KEYS_PER_TEST}),
+            key_values=defaultdict(set),
+        )
+        with patch("impact_collector._trace_collector", collector):
+            trace_key("FUNCTIONS", "ARRAY_GENERATE_RANGE")
+            trace_key("FUNCTIONS", "ARRAY_SORT")
+        self.assertEqual(
+            set(collector.key_values),
+            {
+                (
+                    "FUNCTIONS",
+                    '{"__unknown__":true}',
+                )
+            },
+        )
+        self.assertEqual(collector.trace_key_seen, set())
 
     def test_metadata_in_one_test_does_not_select_unrelated_tests(self):
         source = """
@@ -76,7 +182,6 @@ class TestExample:
 """
         tests = {"tests/example.py::TestExample::test_source_io"}
         self.assertEqual(metadata_references(ast.parse(source), tests), set())
-
 
 if __name__ == "__main__":
     unittest.main()

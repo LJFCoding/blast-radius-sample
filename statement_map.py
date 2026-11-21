@@ -104,6 +104,8 @@ def compact_test_ids(impact: dict) -> None:
     for entries in impact.get("member_reads", {}).values():
         for entry in entries:
             entry[3] = compact(entry[3])
+    for entry in impact.get("key_values", ()):
+        entry[2] = compact(entry[2])
     for key in ("functions", "statements", "classes", "modules"):
         for entries in impact.get(key, {}).values():
             for entry in entries:

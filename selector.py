@@ -8,6 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 import json
 import math
+import operator
 import os
 import re
 import sys
@@ -209,6 +210,78 @@ def _source_reader_indexes(impact: dict, path: str, lines: set[int]) -> set[int]
     return matching | (file_readers - attributed)
 
 
+def _metadata_reader_indexes(impact: dict, _path: str, _lines: set[int]) -> set[int]:
+    metadata = {
+        index
+        for index in impact.get("metadata_tests", ())
+        if isinstance(index, int) and not isinstance(index, bool)
+    }
+    if (
+        _path.startswith("sqlglot/typing/")
+        or _path.startswith("sqlglot/expressions/")
+        or _path == "sqlglot/helper.py"
+    ):
+        return metadata
+    return _source_reader_indexes(impact, _path, _lines) & metadata
+
+
+def _load_test_ids(path: str | None) -> set[str]:
+    if not path:
+        return set()
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return set()
+    return {line.strip() for line in text.splitlines() if line.strip()}
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def apply_selection_overrides(
+    selected: set[str],
+    all_ids: set[str],
+    include_failures: set[str],
+    include_new: set[str],
+) -> tuple[set[str], dict[str, list[str]]]:
+    failures = sorted((include_failures & all_ids) - selected)
+    new_tests = sorted((include_new & all_ids) - selected)
+    updated = set(selected)
+    updated.update(include_failures & all_ids)
+    updated.update(include_new & all_ids)
+    return updated, {
+        "included_previous_failures": failures,
+        "included_new_tests": new_tests,
+    }
+
+
+def selection_reason_counts(
+    changes: dict[str, set[int]] | None,
+    impact: dict,
+    selected: set[str],
+    unchanged_code: frozenset[str],
+    interval_indexes: dict[tuple[str, str], _IntervalIndex] | None = None,
+) -> dict[str, int]:
+    fallback, evidence = selection_evidence(changes, impact, unchanged_code, interval_indexes)
+    if fallback is not None:
+        return {fallback: len(selected)}
+    mapped_tests = impact["tests"]
+    counts: dict[str, int] = {}
+    for reason, numbers in evidence:
+        ids = _ids_for_indexes(numbers, mapped_tests, selected)
+        if ids:
+            counts[reason] = len(ids)
+    return counts
+
+
 def selection_evidence(
     changes: dict[str, set[int]] | None,
     impact: dict,
@@ -227,10 +300,14 @@ def selection_evidence(
                 f"{path}: source read",
                 sorted(_source_reader_indexes(impact, path, lines)),
             ))
+        if path.endswith(".py"):
+            if path not in unchanged_code:
+                evidence.append((
+                    f"{path}: metadata-sensitive test",
+                    sorted(_metadata_reader_indexes(impact, path, lines)),
+                ))
         if path in unchanged_code:
             continue
-        if path.endswith(".py"):
-            evidence.append((f"{path}: metadata-sensitive test", impact["metadata_tests"]))
         if path in impact["fixtures"]:
             evidence.append((f"{path}: fixture read", impact["fixtures"][path]))
             continue
@@ -276,10 +353,172 @@ class _StaticPatchEvidence:
     strings_by_path: dict[str, set[str]]
     container_keys_by_path: dict[str, set[str]]
     container_lines_by_path: dict[str, set[int]]
+    container_ranges_by_path: dict[str, set[tuple[int, int]]]
     container_safe_lines_by_path: dict[str, set[int]]
     container_names_by_path: dict[str, set[str]]
+    container_runtime_safe_keys_by_path: dict[str, set[str]]
     condition_lines_by_path: dict[str, set[int]]
     symbols_by_path: dict[str, set[str]]
+
+
+_UNKNOWN = object()
+
+
+@dataclass(frozen=True)
+class _TraceValue:
+    value: object = _UNKNOWN
+    truth: bool | None = None
+    length: int | None = None
+
+
+def _decode_trace_operand(value: object) -> _TraceValue:
+    if not isinstance(value, dict):
+        return _TraceValue(value=value)
+    if value.get("__unknown__"):
+        return _TraceValue()
+    if "__enum__" in value:
+        enum_value = value["__enum__"][2]
+        return _TraceValue(value=_decode_trace_operand(enum_value).value)
+    if "__symbol__" in value:
+        symbol = value["__symbol__"]
+        return _TraceValue(value=symbol, truth=bool(symbol))
+    if "__tuple__" in value:
+        items = tuple(_decode_trace_operand(item) for item in value["__tuple__"])
+        if all(item.value is not _UNKNOWN for item in items):
+            return _TraceValue(
+                value=tuple(item.value for item in items),
+                truth=bool(items),
+                length=len(items),
+            )
+        return _TraceValue(truth=bool(items), length=len(items))
+    if "__list__" in value:
+        items = [_decode_trace_operand(item) for item in value["__list__"]]
+        if all(item.value is not _UNKNOWN for item in items):
+            return _TraceValue(
+                value=[item.value for item in items],
+                truth=bool(items),
+                length=len(items),
+            )
+        return _TraceValue(truth=bool(items), length=len(items))
+    if "__type__" in value:
+        return _TraceValue(
+            truth=value.get("__truth__"),
+            length=value.get("__length__"),
+        )
+    return _TraceValue()
+
+
+def _ast_reference(node: ast.AST) -> tuple[str, ...] | None:
+    if isinstance(node, ast.Name):
+        return (node.id,)
+    if isinstance(node, ast.Attribute):
+        base = _ast_reference(node.value)
+        return (*base, node.attr) if base else None
+    return None
+
+
+def _eval_trace_expression(node: ast.AST, values: dict[str, _TraceValue]) -> _TraceValue:
+    if isinstance(node, ast.Constant):
+        return _decode_trace_operand(node.value)
+    reference = _ast_reference(node)
+    if reference is not None:
+        return values.get(".".join(reference), _TraceValue())
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        items = [_eval_trace_expression(child, values) for child in node.elts]
+        if any(item.value is _UNKNOWN for item in items):
+            return _TraceValue(truth=bool(items), length=len(items))
+        raw = [item.value for item in items]
+        if isinstance(node, ast.Tuple):
+            return _TraceValue(tuple(raw), bool(raw), len(raw))
+        if isinstance(node, ast.List):
+            return _TraceValue(raw, bool(raw), len(raw))
+        return _TraceValue(set(raw), bool(raw), len(raw))
+    if isinstance(node, ast.BoolOp):
+        operands = [_eval_trace_expression(child, values) for child in node.values]
+        truths = [
+            operand.truth
+            if operand.truth is not None
+            else bool(operand.value)
+            if operand.value is not _UNKNOWN
+            else _UNKNOWN
+            for operand in operands
+        ]
+        if isinstance(node.op, ast.And):
+            if any(truth is False for truth in truths):
+                return _TraceValue(False, False)
+            if all(truth is True for truth in truths):
+                return _TraceValue(True, True)
+            return _TraceValue()
+        if any(truth is True for truth in truths):
+            return _TraceValue(True, True)
+        if all(truth is False for truth in truths):
+            return _TraceValue(False, False)
+        return _TraceValue()
+    if isinstance(node, ast.UnaryOp):
+        operand = _eval_trace_expression(node.operand, values)
+        if isinstance(node.op, ast.Not):
+            truth = operand.truth
+            if truth is None and operand.value is not _UNKNOWN:
+                truth = bool(operand.value)
+            if truth is not None:
+                result = not truth
+                return _TraceValue(result, result)
+        if isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
+            if operand.value is _UNKNOWN:
+                return _TraceValue()
+            operation = {
+                ast.UAdd: operator.pos,
+                ast.USub: operator.neg,
+                ast.Invert: operator.invert,
+            }[type(node.op)]
+            try:
+                result = operation(operand.value)
+                return _TraceValue(result, bool(result))
+            except (TypeError, ValueError):
+                return _TraceValue()
+        return _TraceValue()
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "len" and len(node.args) == 1:
+        operand = _eval_trace_expression(node.args[0], values)
+        if operand.length is not None:
+            return _TraceValue(operand.length, bool(operand.length))
+        return _TraceValue()
+    if isinstance(node, ast.Compare):
+        left = _eval_trace_expression(node.left, values)
+        results = []
+        for operation, comparator in zip(node.ops, node.comparators):
+            right = _eval_trace_expression(comparator, values)
+            if left.value is _UNKNOWN or right.value is _UNKNOWN:
+                return _TraceValue()
+            try:
+                if isinstance(operation, ast.Eq):
+                    result = left.value == right.value
+                elif isinstance(operation, ast.NotEq):
+                    result = left.value != right.value
+                elif isinstance(operation, ast.Lt):
+                    result = left.value < right.value
+                elif isinstance(operation, ast.LtE):
+                    result = left.value <= right.value
+                elif isinstance(operation, ast.Gt):
+                    result = left.value > right.value
+                elif isinstance(operation, ast.GtE):
+                    result = left.value >= right.value
+                elif isinstance(operation, ast.In):
+                    result = left.value in right.value
+                elif isinstance(operation, ast.NotIn):
+                    result = left.value not in right.value
+                elif isinstance(operation, ast.Is):
+                    result = left.value is right.value
+                elif isinstance(operation, ast.IsNot):
+                    result = left.value is not right.value
+                else:
+                    return _TraceValue()
+            except (TypeError, ValueError):
+                return _TraceValue()
+            results.append(result)
+            left = right
+        result = all(results)
+        return _TraceValue(result, result)
+    return _TraceValue()
 
 
 def _assignment_target_names(statement: ast.stmt) -> set[str]:
@@ -330,8 +569,8 @@ def _static_container_value(node: ast.AST) -> bool:
 
 def _container_key_values(
     tree: ast.AST,
-) -> dict[tuple[str, ...], tuple[str, int, bool]]:
-    result: dict[tuple[str, ...], tuple[str, int, bool]] = {}
+) -> dict[tuple[str, ...], tuple[str, int, int, bool]]:
+    result: dict[tuple[str, ...], tuple[str, int, int, bool]] = {}
 
     def collect_value(
         value: ast.AST,
@@ -347,6 +586,7 @@ def _container_key_values(
             result[key_id] = (
                 ast.dump(child, include_attributes=False),
                 key.lineno,
+                child.end_lineno or key.lineno,
                 static_value,
             )
             if isinstance(child, ast.Dict):
@@ -404,6 +644,28 @@ def _condition_values(tree: ast.AST) -> dict[int, tuple[str, set[str]]]:
     return result
 
 
+def _condition_nodes(tree: ast.AST) -> dict[int, ast.expr]:
+    result = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+            result[node.test.lineno] = node.test
+    return result
+
+
+def _changed_condition_pairs(
+    change: FileChange,
+) -> dict[int, tuple[ast.expr, ast.expr]]:
+    original = _condition_nodes(parse_python_source(change.original))
+    modified = _condition_nodes(parse_python_source(change.modified))
+    result = {}
+    for new_line, new_node in modified.items():
+        old_line = change.added_impact_lines.get(new_line, new_line)
+        old_node = original.get(old_line)
+        if old_node is not None and ast.dump(old_node) != ast.dump(new_node):
+            result[old_line] = old_node, new_node
+    return result
+
+
 def _static_patch_evidence(changes: list[FileChange]) -> _StaticPatchEvidence:
     setting_names: set[str] = set()
     module_names: set[str] = set()
@@ -415,8 +677,10 @@ def _static_patch_evidence(changes: list[FileChange]) -> _StaticPatchEvidence:
     strings_by_path: dict[str, set[str]] = {}
     container_keys_by_path: dict[str, set[str]] = defaultdict(set)
     container_lines_by_path: dict[str, set[int]] = defaultdict(set)
+    container_ranges_by_path: dict[str, set[tuple[int, int]]] = defaultdict(set)
     container_safe_lines_by_path: dict[str, set[int]] = defaultdict(set)
     container_names_by_path: dict[str, set[str]] = defaultdict(set)
+    container_runtime_safe_keys_by_path: dict[str, set[str]] = defaultdict(set)
     condition_lines_by_path: dict[str, set[int]] = defaultdict(set)
     symbols_by_path: dict[str, set[str]] = defaultdict(set)
 
@@ -440,6 +704,8 @@ def _static_patch_evidence(changes: list[FileChange]) -> _StaticPatchEvidence:
             container_names_by_path[change.path].add(key[-2])
             old_record = original_keys.get(key)
             new_record = modified_keys.get(key)
+            if old_record is not None and new_record is not None:
+                container_runtime_safe_keys_by_path[change.path].add(key[-1])
             line = (
                 old_record[1]
                 if old_record
@@ -449,10 +715,18 @@ def _static_patch_evidence(changes: list[FileChange]) -> _StaticPatchEvidence:
             )
             if line:
                 container_lines_by_path[change.path].add(line)
+                end_line = (
+                    old_record[2]
+                    if old_record
+                    else new_record[2]
+                    if new_record
+                    else line
+                )
+                container_ranges_by_path[change.path].add((line, end_line))
                 if (
-                    (old_record and new_record and old_record[2] and new_record[2])
-                    or (old_record and not new_record and old_record[2])
-                    or (new_record and not old_record and new_record[2])
+                    (old_record and new_record and old_record[3] and new_record[3])
+                    or (old_record and not new_record and old_record[3])
+                    or (new_record and not old_record and new_record[3])
                 ):
                     container_safe_lines_by_path[change.path].add(line)
         original_conditions = _condition_values(original_tree)
@@ -546,8 +820,10 @@ def _static_patch_evidence(changes: list[FileChange]) -> _StaticPatchEvidence:
         strings_by_path,
         dict(container_keys_by_path),
         dict(container_lines_by_path),
+        dict(container_ranges_by_path),
         dict(container_safe_lines_by_path),
         dict(container_names_by_path),
+        dict(container_runtime_safe_keys_by_path),
         dict(condition_lines_by_path),
         dict(symbols_by_path),
     )
@@ -583,6 +859,91 @@ def _precise_symbol_indexes(dependency: dict, symbols: set[str]) -> set[int]:
         if not symbol.startswith("literal:"):
             for variant in identifier_variants(symbol):
                 result.update(index.get(variant, ()))
+    return result
+
+
+def _runtime_key_indexes(
+    dependency: dict,
+    containers: set[str],
+    keys: set[str],
+) -> set[int] | None:
+    runtime = dependency.get("runtime_keys")
+    unknown = dependency.get("runtime_unknown_keys", {})
+    if not isinstance(runtime, dict) or not isinstance(unknown, dict):
+        return None
+    complete = set(dependency.get("runtime_complete_keys", ()))
+    result = set()
+    for container in containers:
+        name = container.rsplit("::", 1)[-1]
+        if name not in complete:
+            return None
+        for runtime_container in {container, name}:
+            values = runtime.get(runtime_container)
+            if values is not None:
+                if not isinstance(values, dict):
+                    return None
+                for key in keys:
+                    token = json.dumps(key, sort_keys=True, separators=(",", ":"))
+                    result.update(values.get(token, ()))
+            result.update(unknown.get(runtime_container, ()))
+    return result
+
+
+def _module_name(path: str) -> str:
+    parts = list(Path(path).with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _qualified_runtime_containers(
+    static: _StaticPatchEvidence,
+    path: str,
+    dependency: dict,
+) -> set[str]:
+    by_name: dict[str, set[str]] = defaultdict(set)
+    for name in static.settings_by_path.get(path, set()):
+        for owner in static.owners.get(name, set()):
+            by_name[name].add(owner)
+    for name in static.container_names_by_path.get(path, set()):
+        for owner in static.owners.get(name, set()):
+            by_name[name].add(owner)
+
+    result = {
+        f"{_module_name(path)}::{owner}::{name}"
+        for name, owners in by_name.items()
+        for owner in owners
+    }
+    inheritance = dependency.get("class_inheritance", {})
+    if not isinstance(inheritance, dict):
+        return result
+    targets = {
+        name: {owner.rsplit(".", 1)[-1] for owner in owners}
+        for name, owners in by_name.items()
+    }
+    changed = True
+    while changed:
+        changed = False
+        for qualified, bases in inheritance.items():
+            if (
+                "::" not in qualified
+                or not isinstance(bases, list)
+            ):
+                continue
+            class_path, owner = qualified.split("::", 1)
+            base_names = {
+                base.rsplit(".", 1)[-1]
+                for base in bases
+                if isinstance(base, str)
+            }
+            for name, owner_names in targets.items():
+                if not owner_names.intersection(base_names):
+                    continue
+                if owner.rsplit(".", 1)[-1] in owner_names:
+                    continue
+                owner_names.add(owner.rsplit(".", 1)[-1])
+                result.add(f"{_module_name(class_path)}::{owner}::{name}")
+                changed = True
     return result
 
 
@@ -660,7 +1021,7 @@ def select_static_patch(
             continue
         selected.update(
             _ids_for_indexes(
-                impact.get("metadata_tests", ()),
+                _metadata_reader_indexes(impact, path, lines),
                 mapped_tests,
                 all_ids,
             )
@@ -684,6 +1045,22 @@ def select_static_patch(
             dependency,
             static.symbols_by_path.get(path, set()),
         )
+        runtime_containers = _qualified_runtime_containers(
+            static, path, dependency
+        )
+        runtime_safe_keys = static.container_runtime_safe_keys_by_path.get(
+            path, set()
+        )
+        runtime_key_indexes = (
+            _runtime_key_indexes(
+                dependency,
+                runtime_containers or container_names,
+                container_keys,
+            )
+            if container_keys
+            and container_keys <= runtime_safe_keys
+            else None
+        )
         precise_input_indexes = set()
         for text in changed_strings:
             precise_input_indexes.update(
@@ -698,12 +1075,27 @@ def select_static_patch(
                     return None
                 selected.update(_ids_for_indexes(candidates, mapped_tests, all_ids))
                 continue
+            in_container = any(
+                start <= line <= end
+                for start, end in static.container_ranges_by_path.get(path, set())
+            )
+            if in_container and runtime_key_indexes is not None:
+                selected.update(
+                    _ids_for_indexes(
+                        runtime_key_indexes,
+                        mapped_tests,
+                        all_ids,
+                    )
+                )
+                continue
             if (
-                line in container_lines
-                and line in container_safe_lines
+                line in container_safe_lines
                 and key_indexes
                 and container_names
-                and all(name.isupper() for name in container_names)
+                and (
+                    all(name.isupper() for name in container_names)
+                    or container_names <= {"arg_types"}
+                )
             ):
                 key_scope = key_indexes & symbol_indexes
                 if not key_scope:
@@ -746,6 +1138,9 @@ def select_static_patch(
                 )
                 owner_setting_indexes = setting_indexes & owner_tests
                 owner_scope = owner_tests or owner_indexes
+                dynamic_indexes = set(
+                    dependency.get("dynamic_settings", {}).get(name, ())
+                )
                 if name in uncertain_settings:
                     if not owner_scope or (
                         not owner_setting_indexes
@@ -762,9 +1157,6 @@ def select_static_patch(
                     candidate_indexes.update(attributed or owner_setting_indexes)
                 else:
                     candidate_indexes.update(setting_indexes)
-                dynamic_indexes = set(
-                    dependency.get("dynamic_settings", {}).get(name, ())
-                )
                 if name in uncertain_settings:
                     candidate_indexes.update(
                         dynamic_indexes & (owner_tests or precise_input_indexes)
@@ -890,6 +1282,22 @@ def select_condition_patch(
     static = _static_patch_evidence(records)
     if not static.condition_lines_by_path:
         return None
+    condition_pairs: dict[str, dict[int, tuple[ast.expr, ast.expr]]] = {
+        change.path: (
+            _changed_condition_pairs(change)
+            if Path(change.path).suffix == ".py"
+            else {}
+        )
+        for change in records
+    }
+    if any(
+        path in impact.get("fixtures", {})
+        or not path.endswith(".py")
+        or not condition_pairs.get(path)
+        or set(lines) - set(condition_pairs[path])
+        for path, lines in changes.items()
+    ):
+        return None
 
     mapped_tests = impact["tests"]
     selected = all_ids - (set(mapped_tests) & all_ids)
@@ -914,14 +1322,10 @@ def select_condition_patch(
             continue
         selected.update(
             _ids_for_indexes(
-                impact.get("metadata_tests", ()),
+                _metadata_reader_indexes(impact, path, lines),
                 mapped_tests,
                 all_ids,
             )
-        )
-        condition_lines = static.condition_lines_by_path.get(path, set())
-        symbol_indexes = _precise_symbol_indexes(
-            dependency, static.symbols_by_path.get(path, set())
         )
         for line in lines:
             direct = set()
@@ -942,11 +1346,56 @@ def select_condition_patch(
                     break
             if not direct:
                 return None
-            precise = direct & symbol_indexes
-            if line in condition_lines and precise:
-                direct = precise
-                narrowed = True
-            selected.update(_ids_for_indexes(tuple(direct), mapped_tests, all_ids))
+            old_condition, new_condition = condition_pairs[path][line]
+            affected: set[int] = set()
+            traced: set[int] = set()
+            condition_records = (
+                dependency.get("condition_values")
+                or impact.get("condition_values", ())
+            )
+            records_for_line = [
+                entry
+                for entry in condition_records
+                if isinstance(entry, (list, tuple))
+                and len(entry) == 4
+                and entry[0] == path
+                and entry[1] == line
+            ]
+            for _, _, signature, indexes in records_for_line:
+                valid_indexes = {
+                    index
+                    for index in indexes
+                    if isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and index in direct
+                }
+                traced.update(valid_indexes)
+                try:
+                    payload = json.loads(signature)
+                except (json.JSONDecodeError, TypeError):
+                    return None
+                if not payload.get("complete"):
+                    return None
+                encoded = payload.get("values")
+                if not isinstance(encoded, dict):
+                    return None
+                values = {
+                    reference: _decode_trace_operand(value)
+                    for reference, value in encoded.items()
+                }
+                before = _eval_trace_expression(old_condition, values)
+                after = _eval_trace_expression(new_condition, values)
+                if (
+                    before.value is _UNKNOWN
+                    or after.value is _UNKNOWN
+                ):
+                    return None
+                if bool(before.value) != bool(after.value):
+                    affected.update(valid_indexes)
+            if direct - traced:
+                return None
+            narrowed = True
+            selected.update(_ids_for_indexes(tuple(affected), mapped_tests, all_ids))
 
     return selected & all_ids if narrowed else None
 
@@ -961,7 +1410,7 @@ def categorize_patch(
     mapped_tests = impact["tests"]
     unmapped = all_ids - (set(mapped_tests) & all_ids)
     process = _ids_for_indexes(impact.get("process_tests", ()), mapped_tests, all_ids)
-    metadata = _ids_for_indexes(impact.get("metadata_tests", ()), mapped_tests, all_ids)
+    metadata: set[str] = set()
     dynamic = set()
     if dependency is not None:
         dynamic = _ids_for_indexes(
@@ -1034,7 +1483,14 @@ def categorize_patch(
                     impact.get("source_reads", {}).get(path, ()), mapped_tests, all_ids
                 )
             )
-            if path not in unchanged_code:
+            if path.endswith(".py") and path not in unchanged_code:
+                metadata.update(
+                    _ids_for_indexes(
+                        _metadata_reader_indexes(impact, path, lines),
+                        mapped_tests,
+                        all_ids,
+                    )
+                )
                 for line in lines:
                     for kind in ("statements", "functions", "classes", "modules"):
                         matches = _matching_ranges(
@@ -1101,6 +1557,19 @@ def select_tests(
         )
         if static_selected is not None:
             return static_selected
+        condition_selected = select_condition_patch(
+            patch_text,
+            changes,
+            impact,
+            all_ids,
+            dependency,
+            unchanged_code,
+            root,
+            file_records,
+            interval_indexes,
+        )
+        if condition_selected is not None:
+            return condition_selected
     if fallback is not None:
         return all_ids
     mapped_tests = impact["tests"]
@@ -1162,7 +1631,8 @@ def canary_priority_scores(
 
         if path.endswith(".py"):
             add(_source_reader_indexes(impact, path, lines), 1)
-            add(impact.get("metadata_tests", ()), 1)
+            if path not in unchanged_code:
+                add(_metadata_reader_indexes(impact, path, lines), 1)
 
     return scores
 
@@ -1851,6 +2321,23 @@ def main() -> None:
 
     canary_order = os.environ.get("BLAST_RADIUS_CANARY_ORDER") == "1"
     live_probe = os.environ.get("BLAST_RADIUS_LIVE_PROBE") == "1"
+    explain = os.environ.get("BLAST_RADIUS_EXPLAIN") == "1"
+    explain_limit = _env_int("BLAST_RADIUS_EXPLAIN_LIMIT", 20, minimum=1)
+    full_suite_every = _env_int("BLAST_RADIUS_FULL_SUITE_EVERY", 0, minimum=0)
+    include_failures = _load_test_ids(
+        os.environ.get("BLAST_RADIUS_INCLUDE_FAILURES_FILE")
+    ) | {
+        test_id.strip()
+        for test_id in os.environ.get("BLAST_RADIUS_INCLUDE_FAILURES", "").split(",")
+        if test_id.strip()
+    }
+    include_new_tests = _load_test_ids(
+        os.environ.get("BLAST_RADIUS_INCLUDE_NEW_TESTS_FILE")
+    ) | {
+        test_id.strip()
+        for test_id in os.environ.get("BLAST_RADIUS_INCLUDE_NEW_TESTS", "").split(",")
+        if test_id.strip()
+    }
     live_probe_deadline = (
         time.monotonic() + LIVE_PROBE_BUDGET_SECONDS if live_probe else 0.0
     )
@@ -1868,7 +2355,7 @@ def main() -> None:
         except (OSError, UnicodeError, ValueError, SyntaxError) as error:
             print(f"canary ranking unavailable: {error}", file=sys.stderr)
     total_cpu_start = time.process_time()
-    for patch in sorted((DATA / "commits").glob("*.patch")):
+    for patch_index, patch in enumerate(sorted((DATA / "commits").glob("*.patch")), start=1):
         changes = None
         unchanged_code = frozenset()
         records: list[FileChange] = []
@@ -1877,6 +2364,10 @@ def main() -> None:
         cache_before = cache_statistics()
         fallback_reason = "normal dependency match"
         dominance_edges = []
+        override_details = {
+            "included_previous_failures": [],
+            "included_new_tests": [],
+        }
         try:
             text = patch.read_text(encoding="utf-8")
             records = file_changes(text)
@@ -1901,6 +2392,17 @@ def main() -> None:
                 text,
                 interval_indexes=interval_indexes,
                 file_records=records,
+            )
+            if full_suite_every and patch_index % full_suite_every == 0:
+                selected = set(all_ids)
+                fallback_reason = (
+                    f"periodic full-suite guardrail ({full_suite_every})"
+                )
+            selected, override_details = apply_selection_overrides(
+                selected,
+                all_ids,
+                include_failures,
+                include_new_tests,
             )
             if fallback is not None and selected != all_ids:
                 fallback_reason = "static setting/input dependency"
@@ -1967,6 +2469,12 @@ def main() -> None:
                         probe_outcome = probe_results.get(probe_test_id)
                     if passed:
                         selected.difference_update(passed)
+                        selected, override_details = apply_selection_overrides(
+                            selected,
+                            all_ids,
+                            include_failures,
+                            include_new_tests,
+                        )
                         workers = choose_workers(
                             [test for test in tests if test["id"] in selected]
                         )
@@ -2033,7 +2541,19 @@ def main() -> None:
                     key: cache_after[key] - cache_before[key]
                     for key in ("ast_misses", "source_misses", "comment_misses")
                 },
+                "selection_overrides": override_details,
             }
+            if explain:
+                reason_counts = selection_reason_counts(
+                    changes,
+                    impact,
+                    selected,
+                    unchanged_code,
+                    interval_indexes,
+                )
+                diagnostic["selection_reason_counts"] = reason_counts
+                top_ids = sorted(selected)[:explain_limit]
+                diagnostic["selection_reason_sample"] = top_ids
             print(json.dumps(diagnostic, separators=(",", ":")), file=sys.stderr)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
     if diagnostics:
