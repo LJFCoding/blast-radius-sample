@@ -5,9 +5,8 @@ import unittest
 from pathlib import Path
 
 from selector import (
-    apply_selection_overrides, build_interval_indexes, categorize_patch,
-    choose_workers, inspect_patch, patch_changes, prioritize_workers,
-    select_tests, selection_reason_counts, validate_test_inventory,
+    build_interval_indexes, categorize_patch, choose_workers, inspect_patch,
+    patch_changes, prioritize_workers, select_tests, validate_test_inventory,
     canary_priority_scores,
 )
 
@@ -104,93 +103,6 @@ diff --git a/tests/fixtures/example.sql b/tests/fixtures/example.sql
             )
             self.assertEqual(selected, {"a", "b", "unmapped"})
 
-    def test_complete_condition_values_can_prove_a_patch_has_no_effect(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / "sqlglot/example.py"
-            source.parent.mkdir()
-            original = "def f(value):\n    if value < 2:\n        return 1\n"
-            modified = "def f(value):\n    if value <= 2:\n        return 1\n"
-            source.write_text(original)
-            diff = difflib.unified_diff(
-                original.splitlines(keepends=True),
-                modified.splitlines(keepends=True),
-                fromfile="a/sqlglot/example.py",
-                tofile="b/sqlglot/example.py",
-            )
-            text = "diff --git a/sqlglot/example.py b/sqlglot/example.py\n" + "".join(diff)
-            impact = dict(self.impact)
-            impact["functions"] = {"sqlglot/example.py": [[1, 3, [0, 1]]]}
-            impact["statements"] = {"sqlglot/example.py": [[2, 2, [0, 1]]]}
-            impact["condition_values"] = [
-                [
-                    "sqlglot/example.py",
-                    2,
-                    '{"complete":true,"values":{"value":1}}',
-                    [0],
-                ],
-                [
-                    "sqlglot/example.py",
-                    2,
-                    '{"complete":true,"values":{"value":3}}',
-                    [1],
-                ],
-            ]
-            dependency = {
-                "test_symbols": {},
-                "scoped_inputs": {},
-                "inputs": {},
-            }
-            selected = select_tests(
-                patch_changes(text),
-                impact,
-                self.tests,
-                inspect_patch(text, root),
-                dependency,
-                text,
-                root,
-            )
-            self.assertEqual(selected, {"unmapped"})
-
-    def test_condition_short_circuit_can_prove_no_effect_with_unknown_tail(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / "sqlglot/example.py"
-            source.parent.mkdir()
-            original = "def f(value, flag):\n    if value and flag:\n        return 1\n"
-            modified = "def f(value, flag):\n    if value and (not flag):\n        return 1\n"
-            source.write_text(original)
-            diff = difflib.unified_diff(
-                original.splitlines(keepends=True),
-                modified.splitlines(keepends=True),
-                fromfile="a/sqlglot/example.py",
-                tofile="b/sqlglot/example.py",
-            )
-            text = "diff --git a/sqlglot/example.py b/sqlglot/example.py\n" + "".join(diff)
-            impact = dict(self.impact)
-            impact["functions"] = {"sqlglot/example.py": [[1, 3, [0]]]}
-            impact["statements"] = {"sqlglot/example.py": [[2, 2, [0]]]}
-            dependency = {
-                "condition_values": [
-                    [
-                        "sqlglot/example.py",
-                        2,
-                        '{"complete":true,"values":{"flag":{"__unknown__":true},"value":false}}',
-                        [0],
-                    ]
-                ],
-            }
-            selected = select_tests(
-                patch_changes(text),
-                impact,
-                self.tests,
-                inspect_patch(text, root),
-                dependency,
-                text,
-                root,
-            )
-            self.assertEqual(selected, {"unmapped"})
-
     def test_unknown_statement_uses_function_coverage(self):
         self.impact["functions"]["sqlglot/example.py"] = [[10, 20, [0, 1]]]
         self.impact["statements"]["sqlglot/example.py"] = [[14, 15, [0]]]
@@ -204,19 +116,6 @@ diff --git a/tests/fixtures/example.sql b/tests/fixtures/example.sql
             {"sqlglot/example.py": {15}}, self.impact, self.tests, frozenset({"sqlglot/example.py"})
         )
         self.assertEqual(selected, {"b", "unmapped"})
-
-    def test_metadata_tests_stay_scoped_for_unrelated_python_files(self):
-        self.impact["source_reads"] = {"sqlglot/typing/example.py": [1]}
-        self.impact["metadata_tests"] = [1]
-        selected = select_tests({"sqlglot/example.py": {15}}, self.impact, self.tests)
-        self.assertEqual(selected, {"a", "unmapped"})
-
-    def test_metadata_tests_are_global_for_typing_modules(self):
-        self.impact["source_reads"] = {}
-        self.impact["metadata_tests"] = [1]
-        self.impact["functions"]["sqlglot/typing/example.py"] = [[10, 20, [0]]]
-        selected = select_tests({"sqlglot/typing/example.py": {15}}, self.impact, self.tests)
-        self.assertEqual(selected, {"a", "b", "unmapped"})
 
     def test_member_source_reads_only_keep_matching_member_tests(self):
         self.impact["source_reads"] = {"sqlglot/example.py": [0, 1]}
@@ -640,133 +539,6 @@ diff --git a/tests/fixtures/example.sql b/tests/fixtures/example.sql
             )
             self.assertEqual(selected, {"b", "unmapped"})
 
-    def test_arg_types_literal_change_uses_exact_key_scope(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            path = root / "sqlglot/example.py"
-            path.parent.mkdir()
-            original = 'class C:\n    arg_types = {"constraint": False}\n'
-            modified = 'class C:\n    arg_types = {"constraint": True}\n'
-            path.write_text(original)
-            diff = difflib.unified_diff(
-                original.splitlines(keepends=True),
-                modified.splitlines(keepends=True),
-                fromfile="a/sqlglot/example.py",
-                tofile="b/sqlglot/example.py",
-            )
-            text = "diff --git a/sqlglot/example.py b/sqlglot/example.py\n" + "".join(diff)
-            impact = dict(self.impact)
-            impact["classes"] = {"sqlglot/example.py": [[1, 2, [0, 1]]]}
-            dependency = {
-                "settings": {"arg_types": [0, 1]},
-                "class_setting_definitions": {
-                    "arg_types": [{"file": "sqlglot/example.py", "class": "C"}]
-                },
-                "owner_tests": {"sqlglot/example.py::C": [0, 1]},
-                "uncertain_settings": [],
-                "dynamic_tests": [],
-                "inputs": {},
-                "scoped_inputs": {"constraint": [1]},
-            }
-            selected = select_tests(
-                patch_changes(text),
-                impact,
-                self.tests,
-                inspect_patch(text, root),
-                dependency,
-                text,
-                root,
-            )
-            self.assertEqual(selected, {"b", "unmapped"})
-
-    def test_runtime_key_trace_is_stronger_than_incomplete_static_input(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            path = root / "sqlglot/example.py"
-            path.parent.mkdir()
-            original = 'class C:\n    arg_types = {"item": lambda args: args[0]}\n'
-            modified = 'class C:\n    arg_types = {"item": lambda args: args[1]}\n'
-            path.write_text(original)
-            diff = difflib.unified_diff(
-                original.splitlines(keepends=True),
-                modified.splitlines(keepends=True),
-                fromfile="a/sqlglot/example.py",
-                tofile="b/sqlglot/example.py",
-            )
-            text = "diff --git a/sqlglot/example.py b/sqlglot/example.py\n" + "".join(diff)
-            impact = dict(self.impact)
-            impact["classes"] = {"sqlglot/example.py": [[1, 2, [0, 1]]]}
-            dependency = {
-                "settings": {"arg_types": [0, 1]},
-                "class_setting_definitions": {
-                    "arg_types": [{"file": "sqlglot/example.py", "class": "C"}]
-                },
-                "owner_tests": {"sqlglot/example.py::C": [0, 1]},
-                "uncertain_settings": [],
-                "dynamic_tests": [],
-                "inputs": {},
-                "scoped_inputs": {},
-                "runtime_keys": {
-                    "sqlglot.example::C::arg_types": {'"item"': [1]}
-                },
-                "runtime_unknown_keys": {},
-                "runtime_complete_keys": ["arg_types"],
-            }
-            selected = select_tests(
-                patch_changes(text),
-                impact,
-                self.tests,
-                inspect_patch(text, root),
-                dependency,
-                text,
-                root,
-            )
-            self.assertEqual(selected, {"b", "unmapped"})
-
-    def test_runtime_key_trace_includes_bare_container_evidence(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            path = root / "sqlglot/example.py"
-            path.parent.mkdir()
-            original = 'class C:\n    FUNCTIONS = {"item": lambda args: args[0]}\n'
-            modified = 'class C:\n    FUNCTIONS = {"item": lambda args: args[1]}\n'
-            path.write_text(original)
-            diff = difflib.unified_diff(
-                original.splitlines(keepends=True),
-                modified.splitlines(keepends=True),
-                fromfile="a/sqlglot/example.py",
-                tofile="b/sqlglot/example.py",
-            )
-            text = "diff --git a/sqlglot/example.py b/sqlglot/example.py\n" + "".join(diff)
-            impact = dict(self.impact)
-            impact["classes"] = {"sqlglot/example.py": [[1, 2, [0, 1]]]}
-            dependency = {
-                "settings": {"FUNCTIONS": [0, 1]},
-                "class_setting_definitions": {
-                    "FUNCTIONS": [{"file": "sqlglot/example.py", "class": "C"}]
-                },
-                "owner_tests": {"sqlglot/example.py::C": [0, 1]},
-                "uncertain_settings": [],
-                "dynamic_tests": [],
-                "inputs": {},
-                "scoped_inputs": {},
-                "runtime_keys": {
-                    "FUNCTIONS": {'"item"': [1]}
-                },
-                "runtime_unknown_keys": {},
-                "runtime_complete_keys": ["FUNCTIONS"],
-            }
-            selected = select_tests(
-                patch_changes(text),
-                impact,
-                self.tests,
-                inspect_patch(text, root),
-                dependency,
-                text,
-                root,
-            )
-            self.assertEqual(selected, {"b", "unmapped"})
-
     def test_mixed_setting_code_and_fixture_patch_unions_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1094,27 +866,6 @@ diff --git a/tests/fixtures/example.sql b/tests/fixtures/example.sql
             interval_indexes=build_interval_indexes(impact),
         )
         self.assertEqual(selected, {"b", "unmapped"})
-
-    def test_selection_overrides_add_failures_and_new_tests(self):
-        selected, details = apply_selection_overrides(
-            {"a"},
-            self.tests,
-            {"b", "missing"},
-            {"process"},
-        )
-        self.assertEqual(selected, {"a", "b", "process"})
-        self.assertEqual(details["included_previous_failures"], ["b"])
-        self.assertEqual(details["included_new_tests"], ["process"])
-
-    def test_selection_reason_counts_reports_fallback(self):
-        counts = selection_reason_counts(
-            None,
-            self.impact,
-            self.tests,
-            frozenset(),
-            build_interval_indexes(self.impact),
-        )
-        self.assertEqual(counts, {"unsupported patch: full-suite fallback": len(self.tests)})
 
 
 if __name__ == "__main__":

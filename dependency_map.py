@@ -10,7 +10,6 @@ import ast
 import json
 import re
 from collections import defaultdict
-from itertools import product
 from pathlib import Path
 
 INPUT_WORD = re.compile(r"\\[A-Za-z][A-Za-z0-9]*|[A-Za-z_][A-Za-z_0-9]*")
@@ -39,48 +38,6 @@ def literal_symbol(value: object) -> str | None:
         return f"literal:{value!r}"
     if value is None:
         return "literal:none"
-    return None
-
-
-def literal_ast_value(node: ast.AST) -> dict | str | int | float | bool | None:
-    if isinstance(node, ast.Constant):
-        return node.value
-    if isinstance(node, ast.Attribute):
-        path = []
-        current = node
-        while isinstance(current, ast.Attribute):
-            path.append(current.attr)
-            current = current.value
-        if isinstance(current, ast.Name):
-            path.append(current.id)
-            return {"__symbol__": ".".join(reversed(path))}
-        return {"__symbol__": node.attr}
-    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-        values = [literal_ast_value(element) for element in node.elts]
-        if any(value is None for value in values):
-            return None
-        return {
-            (
-                "__tuple__"
-                if isinstance(node, ast.Tuple)
-                else "__list__"
-                if isinstance(node, ast.List)
-                else "__set__"
-            ): values
-        }
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        value = literal_ast_value(node.operand)
-        if isinstance(value, (int, float)):
-            return value if isinstance(node.op, ast.UAdd) else -value
-    return None
-
-
-def reference_path(node: ast.AST) -> tuple[str, ...] | None:
-    if isinstance(node, ast.Name):
-        return (node.id,)
-    if isinstance(node, ast.Attribute):
-        base = reference_path(node.value)
-        return (*base, node.attr) if base else None
     return None
 
 
@@ -407,9 +364,6 @@ def collect_test_evidence(root: Path, impact: dict, settings: dict) -> dict[str,
     words: dict[str, set[int]] = defaultdict(set)
     scoped_inputs: dict[str, set[int]] = defaultdict(set)
     test_symbols: dict[str, set[int]] = defaultdict(set)
-    test_values: dict[int, dict[str, set[str]]] = defaultdict(
-        lambda: defaultdict(set)
-    )
     for name, tests in tests_by_file.items():
         path = root / name
         if path.suffix != ".py" or not path.is_file():
@@ -444,18 +398,7 @@ def collect_test_evidence(root: Path, impact: dict, settings: dict) -> dict[str,
             tests,
             scoped_inputs,
             test_symbols,
-            test_values,
         )
-    for number, domain in enumerate(impact.get("test_domains", ())):
-        if not isinstance(domain, dict):
-            continue
-        for name, values in domain.items():
-            if not isinstance(values, list):
-                continue
-            for variant in identifier_variants(name):
-                for value in values:
-                    if isinstance(value, str):
-                        test_values[number][variant].add(value)
     for name, tests in impact["fixtures"].items():
         path = root / name
         if path.suffix == ".sql" and path.is_file():
@@ -467,7 +410,6 @@ def collect_test_evidence(root: Path, impact: dict, settings: dict) -> dict[str,
                 scoped_inputs[key].update(tests)
     settings["scoped_inputs"] = scoped_inputs
     settings["test_symbols"] = test_symbols
-    settings["test_values"] = test_values
     return words
 
 
@@ -479,7 +421,6 @@ def index_test_contexts(
     indexes: set[int],
     scoped_inputs: dict[str, set[int]],
     test_symbols: dict[str, set[int]],
-    test_values: dict[int, dict[str, set[str]]],
 ) -> None:
     functions: dict[tuple[tuple[str, ...], str], list[ast.FunctionDef | ast.AsyncFunctionDef]] = defaultdict(list)
     classes: dict[tuple[str, ...], ast.ClassDef] = {}
@@ -500,10 +441,7 @@ def index_test_contexts(
             visit(child, parents)
 
     visit(tree)
-    profile_cache: dict[
-        tuple[tuple[str, ...], str],
-        tuple[set[str], set[str], dict[str, set[str]]],
-    ] = {}
+    profile_cache: dict[tuple[tuple[str, ...], str], tuple[set[str], set[str]]] = {}
     for number in indexes:
         test_id = test_ids[number]
         parts = test_id.split("::")
@@ -527,7 +465,6 @@ def index_test_contexts(
         if profile is None:
             inputs = set()
             symbols = set()
-            values: dict[str, set[str]] = defaultdict(set)
             contexts: list[ast.AST] = [matches[0]]
             for length in range(1, len(class_path) + 1):
                 class_node = classes.get(class_path[:length])
@@ -558,38 +495,14 @@ def index_test_contexts(
                         symbols.update(identifier_variants(node.id))
                     elif isinstance(node, ast.Attribute):
                         symbols.update(identifier_variants(node.attr))
-                    if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                        value_node = getattr(node, "value", None)
-                        literal = literal_ast_value(value_node) if value_node else None
-                        if literal is not None:
-                            encoded = json.dumps(
-                                literal, sort_keys=True, separators=(",", ":")
-                            )
-                            for name in assignment_names(node):
-                                for variant in identifier_variants(name):
-                                    values[variant].add(encoded)
-                    elif isinstance(node, ast.Call):
-                        for keyword in node.keywords:
-                            if keyword.arg is None:
-                                continue
-                            literal = literal_ast_value(keyword.value)
-                            if literal is None:
-                                continue
-                            encoded = json.dumps(
-                                literal, sort_keys=True, separators=(",", ":")
-                            )
-                            for variant in identifier_variants(keyword.arg):
-                                values[variant].add(encoded)
             for class_name in class_path:
                 symbols.update(identifier_variants(class_name))
-            profile_cache[cache_key] = (inputs, symbols, dict(values))
-            profile = inputs, symbols, dict(values)
+            profile_cache[cache_key] = (inputs, symbols)
+            profile = inputs, symbols
         for value in profile[0]:
             scoped_inputs[value].add(number)
         for value in profile[1]:
             test_symbols[value].add(number)
-        for name, values in profile[2].items():
-            test_values[number][name].update(values)
 
 
 def build_owner_tests(settings: dict) -> dict[str, list[int]]:
@@ -603,280 +516,9 @@ def build_owner_tests(settings: dict) -> dict[str, list[int]]:
     return {key: sorted(tests) for key, tests in result.items()}
 
 
-def runtime_key_evidence(impact: dict) -> tuple[dict[str, dict[str, list[int]]], dict[str, list[int]]]:
-    known: dict[str, dict[str, set[int]]] = defaultdict(
-        lambda: defaultdict(set)
-    )
-    unknown: dict[str, set[int]] = defaultdict(set)
-    for entry in impact.get("key_values", ()):
-        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
-            continue
-        container, signature, tests = entry
-        if not isinstance(container, str) or not isinstance(tests, (list, tuple)):
-            continue
-        try:
-            payload = json.loads(signature)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if payload.get("__unknown__"):
-            unknown[container].update(tests)
-            continue
-        if "value" not in payload:
-            continue
-        token = json.dumps(payload["value"], sort_keys=True, separators=(",", ":"))
-        known[container][token].update(tests)
-    return (
-        {
-            container: {
-                token: sorted(tests)
-                for token, tests in values.items()
-            }
-            for container, values in known.items()
-        },
-        {
-            container: sorted(tests)
-            for container, tests in unknown.items()
-        },
-    )
-
-
-def runtime_container_completeness(root: Path) -> list[str]:
-    candidates = {"FUNCTIONS", "PROPERTY_PARSERS", "SHOW_PARSERS", "arg_types"}
-    unsafe = set()
-    seen = set()
-
-    def mapping_name(node: ast.AST) -> str | None:
-        if isinstance(node, ast.Attribute):
-            return node.attr
-        if isinstance(node, ast.Name):
-            return node.id.upper()
-        return None
-
-    def enclosing_function(
-        node: ast.AST, parents: dict[ast.AST, ast.AST]
-    ) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-        parent = parents.get(node)
-        while parent is not None:
-            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                return parent
-            if isinstance(parent, ast.ClassDef):
-                return None
-            parent = parents.get(parent)
-        return None
-
-    def exact_runtime_read(
-        node: ast.AST, parents: dict[ast.AST, ast.AST]
-    ) -> bool:
-        parent = parents.get(node)
-        if (
-            isinstance(parent, ast.Subscript)
-            and parent.value is node
-            and isinstance(parent.ctx, ast.Load)
-        ):
-            return True
-        if (
-            isinstance(parent, ast.Attribute)
-            and parent.value is node
-            and parent.attr in {"get", "setdefault", "pop"}
-            and isinstance(parents.get(parent), ast.Call)
-            and parents[parent].func is parent
-        ):
-            return True
-        if (
-            isinstance(parent, ast.Compare)
-            and (
-                (
-                    any(
-                        comparator is node
-                        for comparator in parent.comparators
-                    )
-                    and any(
-                        isinstance(operator, (ast.In, ast.NotIn))
-                        for operator in parent.ops
-                    )
-                )
-                or (
-                    parent.left is node
-                    and all(
-                        isinstance(operator, (ast.Is, ast.IsNot))
-                        and isinstance(comparator, ast.Constant)
-                        and comparator.value is None
-                        for operator, comparator in zip(
-                            parent.ops, parent.comparators
-                        )
-                    )
-                )
-            )
-        ):
-            return True
-        call = parents.get(parent) if isinstance(parent, ast.keyword) else parent
-        if not isinstance(call, ast.Call):
-            return False
-        function = call.func
-        return (
-            (
-                isinstance(function, ast.Attribute)
-                and function.attr in {
-                    "_find_parser",
-                    "_match_texts",
-                    "_parse_function",
-                    "_parse_function_call",
-                }
-            )
-            or (
-                isinstance(function, ast.Name)
-                and function.id in {
-                    "_find_parser",
-                    "_match_texts",
-                    "_parse_function",
-                    "_parse_function_call",
-                }
-            )
-        )
-
-    def safe_alias_assignment(
-        node: ast.AST,
-        parents: dict[ast.AST, ast.AST],
-        function: ast.FunctionDef | ast.AsyncFunctionDef,
-    ) -> bool:
-        parent = parents.get(node)
-        if isinstance(parent, (ast.Assign, ast.AnnAssign)):
-            targets = (
-                parent.targets
-                if isinstance(parent, ast.Assign)
-                else [parent.target]
-            )
-            aliases = {
-                target.id
-                for target in targets
-                if isinstance(target, ast.Name)
-            }
-            if not aliases or parent.value is not node:
-                return False
-            return all(
-                exact_runtime_read(child, parents)
-                for child in ast.walk(function)
-                if (
-                    isinstance(child, ast.Name)
-                    and child.id in aliases
-                    and isinstance(child.ctx, ast.Load)
-                )
-            )
-        return False
-
-    for path in sorted((root / "sqlglot").rglob("*.py")):
-        tree = ast.parse(path.read_bytes(), filename=str(path))
-        parents: dict[ast.AST, ast.AST] = {}
-        for parent in ast.walk(tree):
-            for child in ast.iter_child_nodes(parent):
-                parents[child] = parent
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.Attribute, ast.Name)):
-                continue
-            name = mapping_name(node)
-            if name not in candidates or not isinstance(node.ctx, ast.Load):
-                continue
-            seen.add(name)
-            if exact_runtime_read(node, parents):
-                continue
-            function = enclosing_function(node, parents)
-            if function is None:
-                continue
-            if safe_alias_assignment(node, parents, function):
-                continue
-            unsafe.add(name)
-    return sorted(seen - unsafe)
-
-
-def _expression_references(node: ast.AST) -> set[tuple[str, ...]]:
-    references = set()
-
-    def visit(current: ast.AST) -> None:
-        path = reference_path(current)
-        if isinstance(current, ast.Attribute) and path:
-            references.add(path)
-            return
-        if isinstance(current, ast.Call):
-            for argument in (*current.args, *(keyword.value for keyword in current.keywords)):
-                visit(argument)
-            return
-        if path:
-            references.add(path)
-            return
-        for child in ast.iter_child_nodes(current):
-            visit(child)
-
-    visit(node)
-    return references
-
-
-def condition_evidence(
-    root: Path,
-    impact: dict,
-    test_values: dict[int, dict[str, set[str]]],
-) -> list[list]:
-    unknown = json.dumps(
-        {"__unknown__": True},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    line_tests: dict[tuple[str, int], set[int]] = defaultdict(set)
-    for path, entries in impact.get("statements", {}).items():
-        for start, end, indexes in entries:
-            for line in range(start, end + 1):
-                line_tests[(path, line)].update(indexes)
-
-    grouped: dict[tuple[str, int, str], set[int]] = defaultdict(set)
-    for path in sorted((root / "sqlglot").rglob("*.py")):
-        relative = str(path.relative_to(root))
-        tree = ast.parse(path.read_bytes(), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.If, ast.While, ast.IfExp, ast.Assert)):
-                continue
-            line = node.test.lineno
-            direct = line_tests.get((relative, line), set())
-            if not direct:
-                continue
-            references = sorted(_expression_references(node.test))
-            for number in direct:
-                options = []
-                values_for_test = test_values.get(number, {})
-                for reference in references:
-                    name = ".".join(reference)
-                    candidates = set(values_for_test.get(reference[-1], ()))
-                    candidates.update(
-                        values_for_test.get(reference[-1].lower(), ())
-                    )
-                    if not candidates and reference[-1].isupper():
-                        candidates.add(json.dumps(
-                            {"__symbol__": reference[-1]},
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ))
-                    if not candidates:
-                        candidates.add(unknown)
-                    options.append((name, sorted(candidates)))
-                for combination in product(*(values for _, values in options)):
-                    values = {
-                        name: json.loads(encoded)
-                        for (name, _), encoded in zip(options, combination)
-                    }
-                    signature = json.dumps(
-                        {"complete": True, "values": values},
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    grouped[(relative, line, signature)].add(number)
-    return [
-        [path, line, signature, sorted(indexes)]
-        for (path, line, signature), indexes in sorted(grouped.items())
-    ]
-
-
 def build_dependency_map(root: Path, impact: dict, data) -> dict:
     settings = collect_source_references(root, impact, data)
     inputs = collect_test_evidence(root, impact, settings)
-    runtime_keys, runtime_unknown_keys = runtime_key_evidence(impact)
     return {
         "schema": DEPENDENCY_SCHEMA,
         "settings": {name: sorted(tests) for name, tests in settings["references"].items()},
@@ -916,12 +558,6 @@ def build_dependency_map(root: Path, impact: dict, data) -> dict:
             symbol: sorted(tests)
             for symbol, tests in settings["test_symbols"].items()
         },
-        "runtime_keys": runtime_keys,
-        "runtime_unknown_keys": runtime_unknown_keys,
-        "runtime_complete_keys": runtime_container_completeness(root),
-        "condition_values": condition_evidence(
-            root, impact, settings["test_values"]
-        ),
         "owner_tests": build_owner_tests(settings),
         "equivalence": settings["equivalence"],
     }

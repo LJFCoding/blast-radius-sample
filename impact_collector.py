@@ -3,10 +3,6 @@
 import ast
 import atexit
 import concurrent.futures
-import enum
-import importlib.abc
-import importlib.machinery
-import enum
 import inspect
 import json
 import linecache
@@ -27,177 +23,13 @@ ROOT = Path("/src")
 OUTPUT = Path("/coverage")
 SOURCE = ROOT / "sqlglot"
 FIXTURES = ROOT / "tests" / "fixtures"
-MAX_TRACED_MAPPING_KEYS = 64
-MAX_TRACED_KEYS_PER_TEST = 256
-TRACE_MAPPING_NAMES = frozenset({
-    "FUNCTIONS",
-    "PROPERTY_PARSERS",
-    "SHOW_PARSERS",
-})
 METADATA_ATTRIBUTES = {
     "__code__", "__doc__", "co_firstlineno", "co_lines", "co_positions",
     "currentframe", "extract_tb", "f_code", "f_lineno", "format_exc",
     "format_exception", "format_stack", "stack", "tb_lineno", "_getframe",
 }
-_TRACE_SPECS: dict[str, dict[int, list[str]]] | None = None
-_trace_collector = None
 
 
-def _reference_path(node: ast.AST) -> tuple[str, ...] | None:
-    if isinstance(node, ast.Name):
-        return (node.id,)
-    if isinstance(node, ast.Attribute):
-        base = _reference_path(node.value)
-        return (*base, node.attr) if base else None
-    return None
-
-
-def _mapping_reference(node: ast.AST) -> str | None:
-    reference = _reference_path(node)
-    if not reference:
-        return None
-    name = reference[-1].upper()
-    return name if name in TRACE_MAPPING_NAMES else None
-
-
-def _mapping_names(tree: ast.AST) -> set[str]:
-    result = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        value = getattr(node, "value", None)
-        if not isinstance(value, ast.Dict) or len(value.keys) > MAX_TRACED_MAPPING_KEYS:
-            continue
-        result.update(
-            name
-            for name in assignment_names(node)
-            if name in TRACE_MAPPING_NAMES and value.keys
-        )
-    return result
-
-
-def assignment_names(node: ast.AST) -> set[str]:
-    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-    result = set()
-    for target in targets:
-        reference = _reference_path(target)
-        if reference:
-            result.add(reference[-1])
-    return result
-
-
-def _trace_specs(source_root: Path) -> dict[str, dict[int, list[str]]]:
-    specs: dict[str, dict[int, set[str]]] = defaultdict(lambda: defaultdict(set))
-    for path in sorted(source_root.rglob("*.py")):
-        tree = ast.parse(path.read_bytes(), filename=str(path))
-        filename = str(path)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
-                container = _mapping_reference(node.value)
-                if container:
-                    specs[filename][node.lineno].add(container)
-            elif (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"get", "setdefault", "pop"}
-            ):
-                container = _mapping_reference(node.func.value)
-                if container:
-                    specs[filename][node.lineno].add(container)
-            elif isinstance(node, ast.Compare):
-                for operator, comparator in zip(node.ops, node.comparators):
-                    if not isinstance(operator, (ast.In, ast.NotIn)):
-                        continue
-                    container = _mapping_reference(comparator)
-                    if container:
-                        specs[filename][node.lineno].add(container)
-            elif isinstance(node, ast.FunctionDef) and node.name == "_find_parser":
-                for child in ast.walk(node):
-                    if (
-                        isinstance(child, ast.Subscript)
-                        and isinstance(child.value, ast.Name)
-                        and child.value.id == "parsers"
-                    ):
-                        specs[filename][child.lineno].add("AUTO")
-    return {
-        filename: {
-            line: sorted(containers)
-            for line, containers in lines.items()
-        }
-        for filename, lines in specs.items()
-        if lines
-    }
-
-
-def _trace_value(value: object, depth: int = 0) -> object:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, enum.Enum):
-        return {
-            "__enum__": [
-                type(value).__module__,
-                type(value).__qualname__,
-                _trace_value(value.value, depth + 1),
-            ]
-        }
-    if isinstance(value, tuple) and depth < 2 and len(value) <= 16:
-        return {"__tuple__": [_trace_value(item, depth + 1) for item in value]}
-    if isinstance(value, list) and depth < 2 and len(value) <= 16:
-        return {"__list__": [_trace_value(item, depth + 1) for item in value]}
-    return {"__type__": [type(value).__module__, type(value).__qualname__]}
-
-
-def trace_key(
-    container: str,
-    key: object,
-    owner: object = None,
-    mapping: object = None,
-) -> object:
-    collector = _trace_collector
-    if collector is None or not collector.context:
-        return key
-    if container == "AUTO":
-        if owner is None or mapping is None:
-            return key
-        if getattr(owner, "SHOW_PARSERS", None) is mapping:
-            container = "SHOW_PARSERS"
-        elif getattr(owner, "SET_PARSERS", None) is mapping:
-            container = "SET_PARSERS"
-        else:
-            return key
-    owner_type = owner if inspect.isclass(owner) else type(owner)
-    qualified_container = (
-        f"{owner_type.__module__}::{owner_type.__qualname__}::{container}"
-        if owner is not None
-        else container
-    )
-    count = collector.trace_key_counts[collector.context]
-    if count >= MAX_TRACED_KEYS_PER_TEST:
-        signature = json.dumps(
-            {"__unknown__": True},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        collector.key_values[(qualified_container, signature)].add(collector.context)
-        return key
-    identity = (
-        qualified_container,
-        collector.context,
-        type(key).__module__,
-        type(key).__qualname__,
-        repr(key)[:256],
-    )
-    if identity in collector.trace_key_seen:
-        return key
-    collector.trace_key_seen.add(identity)
-    collector.trace_key_counts[collector.context] = count + 1
-    signature = json.dumps(
-        {"value": _trace_value(key)},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    collector.key_values[(qualified_container, signature)].add(collector.context)
-    return key
 def source_file(name: str | bytes) -> str | None:
     path = os.fsdecode(name)
     if not path.startswith((str(SOURCE) + "/", "sqlglot/", "./sqlglot/")):
@@ -222,10 +54,6 @@ def importing_source() -> bool:
 def record_source(
     name: str | bytes, context: str, reads: dict[str, set[str]], uncertain: set[str]
 ) -> None:
-    collector = _trace_collector
-    if collector is not None:
-        if not context or getattr(collector.local, "instrumenting_import", False):
-            return
     path = source_file(name)
     if not path or importing_source():
         return
@@ -245,21 +73,15 @@ class ChildCollector:
         self.fixtures: dict[str, set[str]] = defaultdict(set)
         self.source_reads: dict[str, set[str]] = defaultdict(set)
         self.member_reads: dict[tuple[str, str, int, int], set[str]] = defaultdict(set)
-        self.key_values: dict[tuple[str, str], set[str]] = defaultdict(set)
-        self.trace_key_seen: set[tuple] = set()
-        self.trace_key_counts: dict[str, int] = defaultdict(int)
-        self.test_domains: dict[str, dict[str, list]] = {}
         self.uncertain_source_reads: set[str] = set()
-        self.local = threading.local()
-        setup_value_trace(self)
-        sys.addaudithook(self.record_event)
-        track_linecache(self)
-        track_inspect(self)
         self.coverage = coverage.Coverage(
             data_file=str(OUTPUT / f".coverage.{worker}.child.{self.pid}"),
             source=[str(SOURCE)],
             config_file=False,
         )
+        sys.addaudithook(self.record_event)
+        track_linecache(self)
+        track_inspect(self)
         self.coverage.start()
         atexit.register(self.finish)
 
@@ -276,7 +98,6 @@ class ChildCollector:
         self.coverage.switch_context(context)
 
     def finish(self) -> None:
-        finish_value_trace(self)
         self.coverage.stop()
         self.coverage.save()
         (OUTPUT / f"child.{self.worker}.{self.pid}.json").write_text(json.dumps({
@@ -293,14 +114,6 @@ class ChildCollector:
                     "contexts": sorted(contexts),
                 }
                 for key, contexts in self.member_reads.items()
-            ],
-            "key_values": [
-                {
-                    "container": key[0],
-                    "signature": key[1],
-                    "contexts": sorted(contexts),
-                }
-                for key, contexts in self.key_values.items()
             ],
             "uncertain_source_reads": sorted(self.uncertain_source_reads),
         }))
@@ -394,194 +207,6 @@ def track_inspect(collector) -> None:
     inspect.getcomments = getcomments
 
 
-class TraceTransformer(ast.NodeTransformer):
-    def __init__(self, filename: str) -> None:
-        self.filename = filename
-        self.specs = _TRACE_SPECS.get(filename, {}) if _TRACE_SPECS else {}
-        self.owner_args: list[ast.expr | None] = []
-        self.function_names: list[str] = []
-
-    def visit_Module(self, node: ast.Module):
-        node = self.generic_visit(node)
-        import_node = ast.ImportFrom(
-            module="impact_collector",
-            names=[ast.alias(name="trace_key", asname="_blast_trace_key")],
-            level=0,
-        )
-        position = 1 if (
-            node.body
-            and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-            and isinstance(node.body[0].value.value, str)
-        ) else 0
-        while (
-            position < len(node.body)
-            and isinstance(node.body[position], ast.ImportFrom)
-            and node.body[position].module == "__future__"
-        ):
-            position += 1
-        node.body.insert(position, import_node)
-        return node
-
-    def _trace_key(
-        self,
-        line: int,
-        container: str,
-        key: ast.expr,
-        mapping: ast.expr | None = None,
-    ) -> ast.expr:
-        if container not in self.specs.get(line, ()):
-            return key
-        traced = ast.Call(
-            func=ast.Name(id="_blast_trace_key", ctx=ast.Load()),
-            args=[
-                ast.Constant(container),
-                key,
-                self.owner_args[-1] if self.owner_args else ast.Constant(None),
-                mapping if mapping is not None else ast.Constant(None),
-            ],
-            keywords=[],
-        )
-        ast.copy_location(traced, key)
-        return traced
-
-    def visit_Subscript(self, node: ast.Subscript):
-        node = self.generic_visit(node)
-        container = _mapping_reference(node.value)
-        if (
-            container is None
-            and self.function_names[-1:] == ["_find_parser"]
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "parsers"
-        ):
-            container = "AUTO"
-        if container:
-            node.slice = self._trace_key(
-                node.lineno, container, node.slice, node.value
-            )
-        return node
-
-    def visit_Call(self, node: ast.Call):
-        node = self.generic_visit(node)
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"get", "setdefault", "pop"}
-            and node.args
-        ):
-            container = _mapping_reference(node.func.value)
-            if container:
-                node.args[0] = self._trace_key(
-                    node.lineno, container, node.args[0]
-                )
-        return node
-
-    def visit_Compare(self, node: ast.Compare):
-        node = self.generic_visit(node)
-        left = node.left
-        for operator, comparator in zip(node.ops, node.comparators):
-            if not isinstance(operator, (ast.In, ast.NotIn)):
-                continue
-            container = _mapping_reference(comparator)
-            if container:
-                left = self._trace_key(node.lineno, container, left)
-                break
-        node.left = left
-        return node
-
-    def _visit_function(self, node):
-        positional = [*node.args.posonlyargs, *node.args.args]
-        owner = (
-            ast.Name(id=positional[0].arg, ctx=ast.Load())
-            if positional
-            and positional[0].arg in {"self", "cls"}
-            else ast.Constant(None)
-        )
-        self.owner_args.append(owner)
-        self.function_names.append(node.name)
-        node = self.generic_visit(node)
-        self.function_names.pop()
-        self.owner_args.pop()
-        return node
-
-    def visit_FunctionDef(self, node: ast.FunctionDef):
-        return self._visit_function(node)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        return self._visit_function(node)
-
-
-def setup_value_trace(collector) -> None:
-    global _TRACE_SPECS, _trace_collector
-    if _TRACE_SPECS is None:
-        _TRACE_SPECS = _trace_specs(SOURCE)
-    if _trace_collector is not None:
-        raise RuntimeError("Value trace collector is already active")
-    _trace_collector = collector
-
-    class TraceLoader(importlib.abc.Loader):
-        def __init__(self, wrapped) -> None:
-            self.wrapped = wrapped
-
-        def create_module(self, spec):
-            create = getattr(self.wrapped, "create_module", None)
-            return create(spec) if create is not None else None
-
-        def exec_module(self, module) -> None:
-            filename = module.__spec__.origin
-            source_getter = getattr(self.wrapped, "get_source", None)
-            collector = _trace_collector
-            try:
-                if collector is not None:
-                    collector.local.instrumenting_import = True
-                if filename not in _TRACE_SPECS or source_getter is None:
-                    self.wrapped.exec_module(module)
-                    return
-                source = source_getter(module.__name__)
-                if source is None:
-                    self.wrapped.exec_module(module)
-                    return
-                tree = ast.parse(source, filename=filename)
-                tree = TraceTransformer(filename).visit(tree)
-                ast.fix_missing_locations(tree)
-                code = compile(tree, filename, "exec")
-                exec(code, module.__dict__)
-                return
-            except (RecursionError, SyntaxError, TypeError) as error:
-                print(
-                    f"Skipping key trace for {filename}: {error}",
-                    file=sys.stderr,
-                )
-                self.wrapped.exec_module(module)
-                return
-            finally:
-                if collector is not None:
-                    collector.local.instrumenting_import = False
-
-    class TraceFinder(importlib.abc.MetaPathFinder):
-        def find_spec(self, fullname, path=None, target=None):
-            if not fullname.startswith("sqlglot"):
-                return None
-            spec = importlib.machinery.PathFinder.find_spec(fullname, path)
-            if spec is not None and spec.loader is not None:
-                spec.loader = TraceLoader(spec.loader)
-            return spec
-
-    collector.value_trace_finder = TraceFinder()
-    sys.meta_path.insert(0, collector.value_trace_finder)
-
-
-def finish_value_trace(collector) -> None:
-    global _trace_collector
-    if _trace_collector is collector:
-        _trace_collector = None
-    finder = getattr(collector, "value_trace_finder", None)
-    if finder is not None:
-        try:
-            sys.meta_path.remove(finder)
-        except ValueError:
-            pass
-
-
 class Collector:
     def __init__(self, worker: str) -> None:
         self.worker = worker
@@ -594,17 +219,12 @@ class Collector:
         self.fixtures: dict[str, set[str]] = defaultdict(set)
         self.source_reads: dict[str, set[str]] = defaultdict(set)
         self.member_reads: dict[tuple[str, str, int, int], set[str]] = defaultdict(set)
-        self.key_values: dict[tuple[str, str], set[str]] = defaultdict(set)
-        self.trace_key_seen: set[tuple] = set()
-        self.trace_key_counts: dict[str, int] = defaultdict(int)
-        self.test_domains: dict[str, dict[str, list]] = {}
         self.uncertain_source_reads: set[str] = set()
         self.process_contexts: set[str] = set()
         self.synchronous_contexts: set[str] = set()
         self.pool_contexts: set[str] = set()
         self.context = ""
         self.local = threading.local()
-        setup_value_trace(self)
         sys.addaudithook(self.record_open)
         track_linecache(self)
         track_inspect(self)
@@ -674,11 +294,9 @@ class Collector:
     def pytest_runtest_setup(self, item):
         self.set_context(f"setup:{item.nodeid}")
         yield
-        self.test_domains[item.nodeid] = test_domain(item)
         self.set_context(f"test:{item.nodeid}")
 
     def pytest_sessionfinish(self, session, exitstatus):
-        finish_value_trace(self)
         self.coverage.stop()
         self.coverage.save()
         (OUTPUT / f"{self.worker}.json").write_text(
@@ -704,15 +322,6 @@ class Collector:
                         }
                         for key, contexts in self.member_reads.items()
                     ],
-                    "key_values": [
-                        {
-                            "container": key[0],
-                            "signature": key[1],
-                            "contexts": sorted(contexts),
-                        }
-                        for key, contexts in self.key_values.items()
-                    ],
-                    "test_domains": self.test_domains,
                     "uncertain_source_reads": sorted(self.uncertain_source_reads),
                 }
             )
@@ -854,73 +463,6 @@ def metadata_tests(tests: set[str]) -> set[str]:
     return selected
 
 
-def _domain_value(value: object, depth: int = 0) -> object:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, enum.Enum):
-        return {"__symbol__": value.name}
-    if isinstance(value, tuple) and depth < 2 and len(value) <= 16:
-        return {"__tuple__": [_domain_value(item, depth + 1) for item in value]}
-    if isinstance(value, (list, set)) and depth < 2 and len(value) <= 16:
-        return {
-            "__list__": [_domain_value(item, depth + 1) for item in value]
-        }
-    value_type = type(value)
-    return {
-        "__type__": [
-            value_type.__module__,
-            value_type.__qualname__,
-        ]
-    }
-
-
-def test_domain(item) -> dict[str, list[str]]:
-    values: dict[str, set[str]] = defaultdict(set)
-
-    def add(name: str, value: object) -> None:
-        for key in {name, name.lower()}:
-            encoded = json.dumps(
-                _domain_value(value),
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            values[key].add(encoded)
-
-    callspec = getattr(item, "callspec", None)
-    if callspec is not None:
-        for name, value in callspec.params.items():
-            add(name, value)
-    for source in (getattr(item, "funcargs", None), getattr(item, "instance", None)):
-        try:
-            entries = dict(vars(source)) if source is not None else {}
-        except TypeError:
-            entries = source if isinstance(source, dict) else {}
-        for name, value in entries.items():
-            if not name.startswith("_"):
-                add(name, value)
-    item_class = getattr(item, "cls", None)
-    if item_class is not None:
-        for base in item_class.__mro__:
-            for name, value in vars(base).items():
-                if (
-                    not name.startswith("_")
-                    and not callable(value)
-                    and isinstance(value, (bool, int, float, str, tuple, list, set, enum.Enum))
-                ):
-                    add(name, value)
-    for source in (getattr(item, "instance", None), getattr(item, "cls", None)):
-        for attribute in ("dialect", "version", "read", "write", "generator", "parser"):
-            try:
-                value = getattr(source, attribute)
-            except (AttributeError, TypeError):
-                continue
-            add(attribute, value)
-    return {
-        name: sorted(encoded)
-        for name, encoded in values.items()
-    }
-
-
 def build_map() -> None:
     records = [json.loads(path.read_text()) for path in sorted(OUTPUT.glob("gw*.json"))]
     children = [json.loads(path.read_text()) for path in sorted(OUTPUT.glob("child.gw*.json"))]
@@ -959,8 +501,6 @@ def build_map() -> None:
     }
     source_contexts: dict[str, set[str]] = defaultdict(set)
     member_contexts: dict[tuple[str, str, int, int], set[str]] = defaultdict(set)
-    key_contexts: dict[tuple[str, str], set[str]] = defaultdict(set)
-    test_domains = {}
     uncertain_source_reads = set()
     for record in records + children:
         for path, contexts in record["source_reads"].items():
@@ -973,12 +513,6 @@ def build_map() -> None:
                 int(entry["end"]),
             )
             member_contexts[key].update(entry["contexts"])
-        for entry in record.get("key_values", ()):
-            key_contexts[(
-                entry["container"],
-                entry["signature"],
-            )].update(entry["contexts"])
-        test_domains.update(record.get("test_domains", {}))
         uncertain_source_reads.update(record["uncertain_source_reads"])
     source_reads = {
         path: sorted(expanded_contexts(contexts, groups))
@@ -992,10 +526,6 @@ def build_map() -> None:
             end,
             sorted(expanded_contexts(contexts, groups)),
         ])
-    key_values = [
-        [container, signature, sorted(expanded_contexts(contexts, groups))]
-        for (container, signature), contexts in sorted(key_contexts.items())
-    ]
 
     data = coverage.CoverageData()
     for path in sorted(OUTPUT.glob(".coverage.gw*")):
@@ -1033,11 +563,6 @@ def build_map() -> None:
             "process_tests": sorted(process_tests),
             "source_reads": source_reads,
             "member_reads": dict(member_reads),
-            "key_values": key_values,
-            "test_domains": [
-                test_domains.get(test, {})
-                for test in sorted(tests)
-            ],
             "uncertain_source_reads": sorted(uncertain_source_reads),
             "metadata_tests": sorted(metadata_tests(tests)),
             "fixtures": fixtures,
