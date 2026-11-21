@@ -19,12 +19,14 @@ class ImpactCollectorTests(unittest.TestCase):
 
     def test_import_reads_are_not_treated_as_source_inspection(self):
         uncertain = set()
+        reads = defaultdict(set)
         with patch("impact_collector.importing_source", return_value=True):
             record_event(
-                "open", ("/src/sqlglot/example.py",), "", defaultdict(set), set(),
-                defaultdict(set), uncertain,
+                "open", ("/src/sqlglot/example.py",), "test:example",
+                defaultdict(set), set(), reads, uncertain,
             )
         self.assertEqual(uncertain, set())
+        self.assertEqual(reads, {})
 
     def test_metadata_in_one_test_does_not_select_unrelated_tests(self):
         source = """
@@ -64,6 +66,15 @@ class TestExample:
     def test_indirect_test_call_without_metadata_does_not_select_tests(self):
         tests = {"tests/example.py::TestExample::test_a", "tests/example.py::TestExample::test_b"}
         source = "class TestExample:\n    def test_b(self): return self.test_a()\n"
+        self.assertEqual(metadata_references(ast.parse(source), tests), set())
+
+    def test_file_io_is_tracked_by_source_reads_not_global_metadata(self):
+        source = """
+class TestExample:
+    def test_source_io(self):
+        return self.path.read_text()
+"""
+        tests = {"tests/example.py::TestExample::test_source_io"}
         self.assertEqual(metadata_references(ast.parse(source), tests), set())
 
 

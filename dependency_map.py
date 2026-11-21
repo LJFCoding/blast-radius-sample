@@ -28,6 +28,17 @@ IDENTIFIER_SUFFIXES = (
 NUMERIC_ESCAPE = re.compile(
     r"\\(?:x[0-9A-Fa-f]{0,2}|u[0-9A-Fa-f]{0,8}|[0-7])"
 )
+DEPENDENCY_SCHEMA = "blast-radius-dependency-map-v2"
+
+
+def literal_symbol(value: object) -> str | None:
+    if isinstance(value, bool):
+        return f"literal:{str(value).lower()}"
+    if isinstance(value, (int, float)):
+        return f"literal:{value!r}"
+    if value is None:
+        return "literal:none"
+    return None
 
 
 def input_words(text: str) -> set[str]:
@@ -430,6 +441,7 @@ def index_test_contexts(
             visit(child, parents)
 
     visit(tree)
+    profile_cache: dict[tuple[tuple[str, ...], str], tuple[set[str], set[str]]] = {}
     for number in indexes:
         test_id = test_ids[number]
         parts = test_id.split("::")
@@ -448,37 +460,49 @@ def index_test_contexts(
             ]
         if len(matches) != 1:
             continue
-        contexts: list[ast.AST] = [matches[0]]
-        for length in range(1, len(class_path) + 1):
-            class_node = classes.get(class_path[:length])
-            if class_node is None:
-                continue
-            contexts.extend(class_node.decorator_list)
-            contexts.extend(class_node.bases)
-            contexts.extend(
-                statement
-                for statement in class_node.body
-                if not isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-            )
-        for context in contexts:
-            for node in ast.walk(context):
-                if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    segment = ast.get_source_segment(source, node) or node.value
-                    for word in input_words(node.value):
-                        scoped_inputs[word].add(number)
-                        for variant in identifier_variants(word):
-                            test_symbols[variant].add(number)
-                    for key in numeric_escape_keys(segment):
-                        scoped_inputs[key].add(number)
-                elif isinstance(node, ast.Name):
-                    for variant in identifier_variants(node.id):
-                        test_symbols[variant].add(number)
-                elif isinstance(node, ast.Attribute):
-                    for variant in identifier_variants(node.attr):
-                        test_symbols[variant].add(number)
-        for class_name in class_path:
-            for variant in identifier_variants(class_name):
-                test_symbols[variant].add(number)
+        cache_key = (class_path, method)
+        profile = profile_cache.get(cache_key)
+        if profile is None:
+            inputs = set()
+            symbols = set()
+            contexts: list[ast.AST] = [matches[0]]
+            for length in range(1, len(class_path) + 1):
+                class_node = classes.get(class_path[:length])
+                if class_node is None:
+                    continue
+                contexts.extend(class_node.decorator_list)
+                contexts.extend(class_node.bases)
+                contexts.extend(
+                    statement
+                    for statement in class_node.body
+                    if not isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                )
+            for context in contexts:
+                for node in ast.walk(context):
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                        segment = ast.get_source_segment(source, node) or node.value
+                        words = input_words(node.value)
+                        inputs.update(words)
+                        for word in words:
+                            symbols.update(identifier_variants(word))
+                        inputs.update(numeric_escape_keys(segment))
+                    elif isinstance(node, ast.Constant):
+                        symbol = literal_symbol(node.value)
+                        if symbol:
+                            inputs.add(symbol)
+                            symbols.add(symbol)
+                    elif isinstance(node, ast.Name):
+                        symbols.update(identifier_variants(node.id))
+                    elif isinstance(node, ast.Attribute):
+                        symbols.update(identifier_variants(node.attr))
+            for class_name in class_path:
+                symbols.update(identifier_variants(class_name))
+            profile_cache[cache_key] = (inputs, symbols)
+            profile = inputs, symbols
+        for value in profile[0]:
+            scoped_inputs[value].add(number)
+        for value in profile[1]:
+            test_symbols[value].add(number)
 
 
 def build_owner_tests(settings: dict) -> dict[str, list[int]]:
@@ -496,6 +520,7 @@ def build_dependency_map(root: Path, impact: dict, data) -> dict:
     settings = collect_source_references(root, impact, data)
     inputs = collect_test_evidence(root, impact, settings)
     return {
+        "schema": DEPENDENCY_SCHEMA,
         "settings": {name: sorted(tests) for name, tests in settings["references"].items()},
         "class_inheritance": settings["inheritance"],
         "class_setting_definitions": {
@@ -528,6 +553,10 @@ def build_dependency_map(root: Path, impact: dict, data) -> dict:
         "inputs": {word: sorted(tests) for word, tests in inputs.items()},
         "scoped_inputs": {
             word: sorted(tests) for word, tests in settings["scoped_inputs"].items()
+        },
+        "test_symbols": {
+            symbol: sorted(tests)
+            for symbol, tests in settings["test_symbols"].items()
         },
         "owner_tests": build_owner_tests(settings),
         "equivalence": settings["equivalence"],

@@ -1,3 +1,4 @@
+import json
 import difflib
 import subprocess
 import tempfile
@@ -7,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from commentry import file_changes
-from live_probe import probe_test_failure
+from live_probe import PROBE_RESULT_PREFIX, probe_test_failure, probe_test_failures
 from selector import live_probe_candidate
 
 
@@ -35,14 +36,15 @@ class LiveProbeTests(unittest.TestCase):
             ),
             tests[0],
         )
-        self.assertIsNone(
+        self.assertEqual(
             live_probe_candidate(
                 {"direct", "slow"},
                 tests,
                 {"sqlglot/example.py": {2}},
                 impact,
                 [[0]],
-            )
+            ),
+            tests[0],
         )
 
     def test_candidate_must_reduce_the_current_worker_bottleneck(self):
@@ -83,7 +85,14 @@ class LiveProbeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(
                     command,
                     1,
-                    stdout=f"FAILED {test_id} - AssertionError\n",
+                    stdout=(
+                        PROBE_RESULT_PREFIX
+                        + json.dumps({
+                            "results": {test_id: "failed"},
+                            "collection_failed": False,
+                            "exit_code": 1,
+                        })
+                    ),
                 )
 
             with patch("live_probe.subprocess.run", side_effect=report_failure):
@@ -104,7 +113,18 @@ class LiveProbeTests(unittest.TestCase):
             root, patch_text, changes, test_id, _ = self._example_patch(directory)
             with patch(
                 "live_probe.subprocess.run",
-                return_value=subprocess.CompletedProcess([], 0, stdout=". 1 passed"),
+                return_value=subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=(
+                        PROBE_RESULT_PREFIX
+                        + json.dumps({
+                            "results": {test_id: "passed"},
+                            "collection_failed": False,
+                            "exit_code": 0,
+                        })
+                    ),
+                ),
             ):
                 self.assertEqual(
                     probe_test_failure(
@@ -135,6 +155,40 @@ class LiveProbeTests(unittest.TestCase):
                         1,
                     ),
                     "unknown",
+                )
+
+    def test_batch_reports_each_conclusive_test_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, patch_text, changes, test_id, _ = self._example_patch(directory)
+            other = "tests/test_example.py::test_other"
+            with patch(
+                "live_probe.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    [],
+                    1,
+                    stdout=(
+                        PROBE_RESULT_PREFIX
+                        + json.dumps({
+                            "results": {
+                                test_id: "failed",
+                                other: "passed",
+                            },
+                            "collection_failed": False,
+                            "exit_code": 1,
+                        })
+                    ),
+                ),
+            ):
+                self.assertEqual(
+                    probe_test_failures(
+                        root,
+                        changes,
+                        patch_text,
+                        [test_id, other],
+                        time.monotonic() + 10,
+                        2,
+                    ),
+                    {test_id: "failed", other: "passed"},
                 )
 
     def _example_patch(self, directory):

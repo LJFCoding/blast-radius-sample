@@ -69,21 +69,71 @@ diff --git a/tests/fixtures/example.sql b/tests/fixtures/example.sql
         selected = select_tests({"sqlglot/example.py": {15}}, self.impact, self.tests)
         self.assertEqual(selected, {"a", "unmapped"})
 
+    def test_condition_symbols_remain_conservative_until_proven(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sqlglot/example.py"
+            source.parent.mkdir()
+            original = "def f(scale):\n    if scale == Unit.MICROS:\n        return 1\n    return 0\n"
+            modified = "def f(scale):\n    if scale != Unit.MICROS:\n        return 1\n    return 0\n"
+            source.write_text(original)
+            diff = difflib.unified_diff(
+                original.splitlines(keepends=True),
+                modified.splitlines(keepends=True),
+                fromfile="a/sqlglot/example.py",
+                tofile="b/sqlglot/example.py",
+            )
+            text = "diff --git a/sqlglot/example.py b/sqlglot/example.py\n" + "".join(diff)
+            impact = dict(self.impact)
+            impact["functions"] = {"sqlglot/example.py": [[1, 4, [0, 1]]]}
+            impact["statements"] = {"sqlglot/example.py": [[2, 2, [0, 1]]]}
+            dependency = {
+                "test_symbols": {"micros": [0]},
+                "scoped_inputs": {},
+                "inputs": {},
+            }
+            selected = select_tests(
+                patch_changes(text),
+                impact,
+                self.tests,
+                inspect_patch(text, root),
+                dependency,
+                text,
+                root,
+            )
+            self.assertEqual(selected, {"a", "b", "unmapped"})
+
     def test_unknown_statement_uses_function_coverage(self):
         self.impact["functions"]["sqlglot/example.py"] = [[10, 20, [0, 1]]]
         self.impact["statements"]["sqlglot/example.py"] = [[14, 15, [0]]]
         selected = select_tests({"sqlglot/example.py": {16}}, self.impact, self.tests)
         self.assertEqual(selected, {"a", "b", "unmapped"})
 
-    def test_comment_change_includes_source_and_metadata_readers(self):
+    def test_unchanged_comment_includes_only_source_and_unmapped_readers(self):
         self.impact["source_reads"] = {"sqlglot/example.py": [1]}
         self.impact["metadata_tests"] = [0]
         selected = select_tests(
             {"sqlglot/example.py": {15}}, self.impact, self.tests, frozenset({"sqlglot/example.py"})
         )
-        self.assertEqual(selected, {"a", "b", "unmapped"})
+        self.assertEqual(selected, {"b", "unmapped"})
 
-    def test_standalone_comment_is_not_assumed_harmless(self):
+    def test_member_source_reads_only_keep_matching_member_tests(self):
+        self.impact["source_reads"] = {"sqlglot/example.py": [0, 1]}
+        self.impact["member_reads"] = {
+            "sqlglot/example.py": [
+                ["function_a", 14, 16, [0]],
+                ["function_b", 30, 32, [1]],
+            ],
+        }
+        selected = select_tests(
+            {"sqlglot/example.py": {15}},
+            self.impact,
+            self.tests,
+            frozenset({"sqlglot/example.py"}),
+        )
+        self.assertEqual(selected, {"a", "unmapped"})
+
+    def test_plain_standalone_comment_skips_executable_coverage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "sqlglot/example.py"
@@ -99,10 +149,16 @@ diff --git a/tests/fixtures/example.sql b/tests/fixtures/example.sql
             )
             text = "diff --git a/sqlglot/example.py b/sqlglot/example.py\n" + "".join(diff)
             self.impact["functions"]["sqlglot/example.py"] = [[1, 4, [0]]]
-            self.assertEqual(inspect_patch(text, root), frozenset())
-            self.assertIn("a", select_tests(
-                patch_changes(text), self.impact, self.tests, inspect_patch(text, root)
-            ))
+            self.assertEqual(inspect_patch(text, root), frozenset({"sqlglot/example.py"}))
+            self.assertEqual(
+                select_tests(
+                    patch_changes(text),
+                    self.impact,
+                    self.tests,
+                    inspect_patch(text, root),
+                ),
+                {"unmapped"},
+            )
 
     def test_code_change_includes_source_readers(self):
         self.impact["source_reads"] = {"sqlglot/example.py": [1]}
@@ -366,7 +422,7 @@ diff --git a/tests/fixtures/example.sql b/tests/fixtures/example.sql
             )
             self.assertEqual(selected, {"a", "unmapped"})
 
-    def test_static_patch_ignores_short_dictionary_keys(self):
+    def test_static_patch_uses_exact_short_dictionary_key_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "sqlglot/example.py"
@@ -392,7 +448,7 @@ diff --git a/tests/fixtures/example.sql b/tests/fixtures/example.sql
                 "uncertain_settings": [],
                 "dynamic_tests": [],
                 "inputs": {"x": [1]},
-                "scoped_inputs": {"x": [1]},
+                "scoped_inputs": {"escape:x": [1]},
             }
             selected = select_tests(
                 patch_changes(text),
@@ -403,7 +459,85 @@ diff --git a/tests/fixtures/example.sql b/tests/fixtures/example.sql
                 text,
                 root,
             )
-            self.assertEqual(selected, {"a", "unmapped"})
+            self.assertEqual(selected, {"b", "unmapped"})
+
+    def test_dynamic_container_values_keep_full_static_setting_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "sqlglot/example.py"
+            path.parent.mkdir()
+            original = 'class C:\n    PARSERS = {"item": lambda args: args[0]}\n'
+            modified = 'class C:\n    PARSERS = {"item": lambda args: args[1]}\n'
+            path.write_text(original)
+            diff = difflib.unified_diff(
+                original.splitlines(keepends=True),
+                modified.splitlines(keepends=True),
+                fromfile="a/sqlglot/example.py",
+                tofile="b/sqlglot/example.py",
+            )
+            text = "diff --git a/sqlglot/example.py b/sqlglot/example.py\n" + "".join(diff)
+            impact = dict(self.impact)
+            impact["classes"] = {"sqlglot/example.py": [[1, 2, [0, 1]]]}
+            dependency = {
+                "settings": {"PARSERS": [0, 1]},
+                "class_setting_definitions": {
+                    "PARSERS": [{"file": "sqlglot/example.py", "class": "C"}]
+                },
+                "owner_tests": {"sqlglot/example.py::C": [0, 1]},
+                "uncertain_settings": [],
+                "dynamic_tests": [],
+                "inputs": {},
+                "scoped_inputs": {"item": [1]},
+            }
+            selected = select_tests(
+                patch_changes(text),
+                impact,
+                self.tests,
+                inspect_patch(text, root),
+                dependency,
+                text,
+                root,
+            )
+            self.assertEqual(selected, {"a", "b", "unmapped"})
+
+    def test_literal_configured_container_call_uses_exact_key_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "sqlglot/example.py"
+            path.parent.mkdir()
+            original = 'class C:\n    PARSERS = {"item": builder("item", target=True)}\n'
+            modified = 'class C:\n    PARSERS = {"item": builder("item", target=False)}\n'
+            path.write_text(original)
+            diff = difflib.unified_diff(
+                original.splitlines(keepends=True),
+                modified.splitlines(keepends=True),
+                fromfile="a/sqlglot/example.py",
+                tofile="b/sqlglot/example.py",
+            )
+            text = "diff --git a/sqlglot/example.py b/sqlglot/example.py\n" + "".join(diff)
+            impact = dict(self.impact)
+            impact["classes"] = {"sqlglot/example.py": [[1, 2, [0, 1]]]}
+            dependency = {
+                "settings": {"PARSERS": [0, 1]},
+                "class_setting_definitions": {
+                    "PARSERS": [{"file": "sqlglot/example.py", "class": "C"}]
+                },
+                "owner_tests": {"sqlglot/example.py::C": [0, 1]},
+                "uncertain_settings": [],
+                "dynamic_tests": [],
+                "inputs": {},
+                "scoped_inputs": {"item": [1]},
+            }
+            selected = select_tests(
+                patch_changes(text),
+                impact,
+                self.tests,
+                inspect_patch(text, root),
+                dependency,
+                text,
+                root,
+            )
+            self.assertEqual(selected, {"b", "unmapped"})
 
     def test_mixed_setting_code_and_fixture_patch_unions_evidence(self):
         with tempfile.TemporaryDirectory() as directory:

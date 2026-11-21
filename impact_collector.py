@@ -3,6 +3,7 @@
 import ast
 import atexit
 import concurrent.futures
+import inspect
 import json
 import linecache
 import multiprocessing.process
@@ -25,9 +26,7 @@ FIXTURES = ROOT / "tests" / "fixtures"
 METADATA_ATTRIBUTES = {
     "__code__", "__doc__", "co_firstlineno", "co_lines", "co_positions",
     "currentframe", "extract_tb", "f_code", "f_lineno", "format_exc",
-    "format_exception", "format_stack", "getcomments", "getfile", "getsource",
-    "getsourcefile", "getsourcelines", "read_bytes", "read_text", "stack",
-    "tb_lineno", "_getframe",
+    "format_exception", "format_stack", "stack", "tb_lineno", "_getframe",
 }
 
 
@@ -56,11 +55,12 @@ def record_source(
     name: str | bytes, context: str, reads: dict[str, set[str]], uncertain: set[str]
 ) -> None:
     path = source_file(name)
-    if path:
-        if context:
-            reads[path].add(context)
-        elif not importing_source():
-            uncertain.add(path)
+    if not path or importing_source():
+        return
+    if context:
+        reads[path].add(context)
+    else:
+        uncertain.add(path)
 
 
 class ChildCollector:
@@ -72,6 +72,7 @@ class ChildCollector:
         self.process_contexts: set[str] = set()
         self.fixtures: dict[str, set[str]] = defaultdict(set)
         self.source_reads: dict[str, set[str]] = defaultdict(set)
+        self.member_reads: dict[tuple[str, str, int, int], set[str]] = defaultdict(set)
         self.uncertain_source_reads: set[str] = set()
         self.coverage = coverage.Coverage(
             data_file=str(OUTPUT / f".coverage.{worker}.child.{self.pid}"),
@@ -80,6 +81,7 @@ class ChildCollector:
         )
         sys.addaudithook(self.record_event)
         track_linecache(self)
+        track_inspect(self)
         self.coverage.start()
         atexit.register(self.finish)
 
@@ -103,6 +105,16 @@ class ChildCollector:
             "process_contexts": sorted(self.process_contexts),
             "fixtures": {path: sorted(contexts) for path, contexts in self.fixtures.items()},
             "source_reads": {path: sorted(contexts) for path, contexts in self.source_reads.items()},
+            "member_reads": [
+                {
+                    "path": key[0],
+                    "member": key[1],
+                    "start": key[2],
+                    "end": key[3],
+                    "contexts": sorted(contexts),
+                }
+                for key, contexts in self.member_reads.items()
+            ],
             "uncertain_source_reads": sorted(self.uncertain_source_reads),
         }))
 
@@ -157,6 +169,44 @@ def track_linecache(collector) -> None:
     linecache.getlines = getlines
 
 
+def track_inspect(collector) -> None:
+    original_getsourcelines = inspect.getsourcelines
+    original_getcomments = inspect.getcomments
+
+    def record_member(obj, start: int, end: int) -> None:
+        try:
+            filename = inspect.getsourcefile(obj) or inspect.getfile(obj)
+        except (OSError, TypeError):
+            return
+        path = source_file(filename)
+        if not path:
+            return
+        member = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
+        collector.member_reads[(path, member, start, end)].add(collector.context)
+        if not collector.context:
+            collector.uncertain_source_reads.add(path)
+
+    @wraps(original_getsourcelines)
+    def getsourcelines(obj):
+        result = original_getsourcelines(obj)
+        record_member(obj, result[1], result[1] + len(result[0]) - 1)
+        return result
+
+    @wraps(original_getcomments)
+    def getcomments(obj):
+        result = original_getcomments(obj)
+        try:
+            lines, start = original_getsourcelines(obj)
+        except (OSError, TypeError):
+            lines, start = [], 1
+        if lines:
+            record_member(obj, start, start + len(lines) - 1)
+        return result
+
+    inspect.getsourcelines = getsourcelines
+    inspect.getcomments = getcomments
+
+
 class Collector:
     def __init__(self, worker: str) -> None:
         self.worker = worker
@@ -168,6 +218,7 @@ class Collector:
         self.tests: set[str] = set()
         self.fixtures: dict[str, set[str]] = defaultdict(set)
         self.source_reads: dict[str, set[str]] = defaultdict(set)
+        self.member_reads: dict[tuple[str, str, int, int], set[str]] = defaultdict(set)
         self.uncertain_source_reads: set[str] = set()
         self.process_contexts: set[str] = set()
         self.synchronous_contexts: set[str] = set()
@@ -176,6 +227,7 @@ class Collector:
         self.local = threading.local()
         sys.addaudithook(self.record_open)
         track_linecache(self)
+        track_inspect(self)
         self.track_processes()
         self.coverage.start()
 
@@ -260,6 +312,16 @@ class Collector:
                     "source_reads": {
                         path: sorted(contexts) for path, contexts in self.source_reads.items()
                     },
+                    "member_reads": [
+                        {
+                            "path": key[0],
+                            "member": key[1],
+                            "start": key[2],
+                            "end": key[3],
+                            "contexts": sorted(contexts),
+                        }
+                        for key, contexts in self.member_reads.items()
+                    ],
                     "uncertain_source_reads": sorted(self.uncertain_source_reads),
                 }
             )
@@ -438,15 +500,32 @@ def build_map() -> None:
         for path, contexts in fixture_contexts.items()
     }
     source_contexts: dict[str, set[str]] = defaultdict(set)
+    member_contexts: dict[tuple[str, str, int, int], set[str]] = defaultdict(set)
     uncertain_source_reads = set()
     for record in records + children:
         for path, contexts in record["source_reads"].items():
             source_contexts[path].update(contexts)
+        for entry in record.get("member_reads", ()):
+            key = (
+                entry["path"],
+                entry["member"],
+                int(entry["start"]),
+                int(entry["end"]),
+            )
+            member_contexts[key].update(entry["contexts"])
         uncertain_source_reads.update(record["uncertain_source_reads"])
     source_reads = {
         path: sorted(expanded_contexts(contexts, groups))
         for path, contexts in source_contexts.items()
     }
+    member_reads: dict[str, list[list]] = defaultdict(list)
+    for (path, member, start, end), contexts in sorted(member_contexts.items()):
+        member_reads[path].append([
+            member,
+            start,
+            end,
+            sorted(expanded_contexts(contexts, groups)),
+        ])
 
     data = coverage.CoverageData()
     for path in sorted(OUTPUT.glob(".coverage.gw*")):
@@ -483,6 +562,7 @@ def build_map() -> None:
             "tests": sorted(tests),
             "process_tests": sorted(process_tests),
             "source_reads": source_reads,
+            "member_reads": dict(member_reads),
             "uncertain_source_reads": sorted(uncertain_source_reads),
             "metadata_tests": sorted(metadata_tests(tests)),
             "fixtures": fixtures,

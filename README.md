@@ -69,8 +69,10 @@ map are always selected.
 Standalone and same-line inline Python comment changes are checked against
 the original and patched syntax trees. Inline changes must leave the code
 and its positions unchanged and must not contain directives. For these
-changes the selector retains known source readers and code-metadata tests
-instead of assuming comments are harmless.
+changes the selector skips executable coverage but retains tests with an
+attributed read of the changed source member. Ordinary lazy imports are not
+treated as source inspection. General code-metadata tests are retained only
+for executable-code changes.
 The same applies to formatting changes only when syntax, source positions,
 encoding and comment positions all remain unchanged. Other changes fall back
 to normal dependency selection. Tests that inspect metadata are narrowed to
@@ -98,13 +100,14 @@ such as `heavy_fails_implies_canary_fails_observed`, but those edges are marked
 `safe_for_selection: false`. They are evidence for the supplied observation
 set, not a guarantee for the hidden patch batch.
 
-At runtime, the selector can opt in to spending up to 35 seconds probing one directly
-impacted test for an expensive patch, but only when removing it is estimated
-to save at least two seconds in the scheduled test cost. If pytest confirms
-that test passes against the patched source, only that test is removed from
-the normal selection. Failed, timed-out, and inconclusive probes remain
-selected, so the probe cannot replace the selector's other candidates or hide
-their failures. This uses no precomputed patch-to-failure table. Set
+At runtime, the selector can opt in to spending up to 35 seconds probing a
+small batch of exact affected tests against the patched source. Ordinary
+`unittest.TestCase` methods run without pytest collection overhead; pytest is
+used as a conservative fallback for fixture and parameterized tests. Each test
+with a conclusive passing result is removed, while failed, timed-out,
+skipped, and inconclusive results remain selected. Branch/value evidence can
+prioritize the probe batch, but it never removes an unprobed test by itself.
+This uses no precomputed patch-to-failure table. Set
 `BLAST_RADIUS_LIVE_PROBE=1` to enable it; probing is disabled by default
 because an exact patched test run costs CPU and did not improve the sample
 batch. The probe adds the test dependencies to the image and consumes part of
@@ -122,9 +125,12 @@ Coverage and source-read observations come from the unchanged revision and
 do not guarantee detection of every hidden regression.
 
 Static-setting evidence is indexed per test method as well as per file. This
-allows changed dictionary keys and input phrases to retain tests that actually
-mention the feature, while avoiding one-letter keys such as `x` and `u`.
-Numeric escape changes use separate `\x`, `\u`, and octal evidence. Class
+allows changed static table entries and input phrases to retain tests that
+actually mention the feature. One-letter dictionary keys are used only when
+they have dedicated escape evidence. Literal table values and literal
+configuration calls can use exact-key scoping; lambda/callable table values
+retain the broader conservative setting scope. Numeric escape changes use
+separate `\x`, `\u`, and octal evidence. Class
 owners and reflected readers are scoped to tests that identify the affected
 dialect or class; unresolved dynamic ownership still falls back to broader
 retention.

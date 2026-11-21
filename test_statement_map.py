@@ -42,6 +42,7 @@ class StatementMapTests(unittest.TestCase):
             "metadata_tests": ["test_a"],
             "fixtures": {"fixture.sql": ["test_b"]},
             "source_reads": {"source.py": ["test_a"]},
+            "member_reads": {"source.py": [["function", 2, 3, ["test_b"]]]},
             "functions": {"source.py": [[1, 4, ["test_a", "test_b"]]]},
             "statements": {"source.py": [[2, 2, ["test_b"]]]},
             "classes": {"source.py": [[1, 4, ["test_a"]]]},
@@ -54,6 +55,7 @@ class StatementMapTests(unittest.TestCase):
         self.assertEqual(impact["modules"]["source.py"][0][2], [1])
         self.assertEqual(impact["fixtures"]["fixture.sql"], [1])
         self.assertEqual(impact["process_tests"], [1])
+        self.assertEqual(impact["member_reads"]["source.py"][0][3], [1])
 
 
 if __name__ == "__main__":

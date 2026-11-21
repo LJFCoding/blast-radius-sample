@@ -78,6 +78,7 @@ class DependencyMapTests(unittest.TestCase):
                 "class TestSnowflake:\n"
                 "    dialect = \"snowflake\"\n\n"
                 "    def test_escape(self):\n"
+                "        version = (23, 12)\n"
                 "        self.validate_identity(\"SELECT needle\")\n\n"
                 "        self.validate_identity(r\"SELECT \\\\x41\")\n\n"
                 "    def test_other(self):\n"
@@ -103,6 +104,8 @@ class DependencyMapTests(unittest.TestCase):
                 {0},
             )
             self.assertEqual(result["scoped_inputs"]["escape:x"], [0])
+            self.assertEqual(result["scoped_inputs"]["literal:23"], [0])
+            self.assertEqual(result["test_symbols"]["literal:12"], [0])
 
     def test_empty_query_is_rejected(self):
         with self.assertRaises(ValueError):
